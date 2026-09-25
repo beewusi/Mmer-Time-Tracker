@@ -16,8 +16,7 @@ function Profile({ user, profile, onProfileUpdate, onBack, isDarkMode, avatarUrl
   const [avatarError, setAvatarError] = useState('');
   const fileInputRef = useRef(null);
 
-  // profile loads asynchronously in Dashboard, so if this page is opened
-  // before that finishes, sync the name in once it arrives.
+  // profile loads async in Dashboard, sync the name in once it arrives.
   useEffect(() => {
     if (profile?.full_name && !fullName) {
       setFullName(profile.full_name);
@@ -25,8 +24,8 @@ function Profile({ user, profile, onProfileUpdate, onBack, isDarkMode, avatarUrl
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [profile]);
 
-  // profiles.department is the source of truth — an admin sets it at
-  // approval time and it's never editable here.
+  // Department comes from profiles (set by the admin on approval), not
+  // editable here.
   const department = profile?.department || '';
 
   function getFirstName() {
@@ -45,8 +44,7 @@ function Profile({ user, profile, onProfileUpdate, onBack, isDarkMode, avatarUrl
       }
     });
 
-    // Only full_name changes here — department is admin-owned and is
-    // never sent back, so it can't get clobbered by a profile edit.
+    // Only full_name is saved here, department is admin-only.
     const { error: profileError } = await supabase
       .from('profiles')
       .update({ full_name: fullName })
@@ -84,8 +82,8 @@ function Profile({ user, profile, onProfileUpdate, onBack, isDarkMode, avatarUrl
       const dataUrl = reader.result;
       onAvatarChange?.(dataUrl);
 
-      // Upload to Supabase Storage and save the public URL against the
-      // user's profile. Requires an "avatars" storage bucket.
+      // Upload to Supabase Storage ("avatars" bucket) and save the public URL
+      // on the profile.
       try {
         const filePath = `${user.id}-${Date.now()}.jpg`;
         const { error: uploadError } = await supabase

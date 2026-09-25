@@ -1,53 +1,30 @@
 // supabase/functions/reminder-sweep/index.ts
 //
-// I'm calling this "reminder-sweep" because that's exactly what it does
-// every time it runs: it sweeps the employee_status and profiles tables
-// for anyone who has crossed a reminder threshold and hasn't been
-// notified yet, and emails them. Unlike the in-app timers in
-// Dashboard.js, this runs on Supabase's servers on a schedule (see
-// CRON_SETUP.sql), so it keeps working even if every employee's browser
-// tab is closed.
+// Runs on a schedule (CRON_SETUP.sql). Checks employee_status and profiles for
+// anyone past a reminder threshold who hasn't been notified yet, then sends an
+// email and a desktop push. Works with every tab closed.
+// - Push only reaches browsers where the employee turned on desktop
+//   notifications (src/lib/push.js). Otherwise it's email only.
+// - Also does the 8h15m auto clock-out: saves the record and sets them
+//   clocked_out.
 //
-// What this can and can't do, so I don't oversell it to myself later:
-// - It CAN send email reminders regardless of whether anyone has the
-//   app open, because it runs on a schedule on Supabase's servers, not
-//   in anyone's browser.
-// - It now ALSO sends real desktop push notifications, the same way —
-//   these show up even with the Mmerℇ tab fully closed, as long as the
-//   employee clicked "Enable Desktop Notifications" at least once on
-//   this browser (see src/lib/push.js). If they haven't, or they're on
-//   a browser/device that was never enabled, they only get the email.
-// - It also now performs the real 8h15m auto clock-out server-side —
-//   inserting the finished record and marking the employee clocked_out
-//   — instead of the old comment in Dashboard.js that claimed this was
-//   already happening when it wasn't.
-//
-// Before deploying this, I need to have already run
-// supabase/REMINDER_SWEEP_SCHEMA.sql and
-// supabase/PUSH_SUBSCRIPTIONS_SCHEMA.sql once, and set the
-// EMAILJS_PRIVATE_KEY and VAPID_* secrets (see the notes near where
-// each is read below).
+// Needs REMINDER_SWEEP_SCHEMA.sql and PUSH_SUBSCRIPTIONS_SCHEMA.sql run first,
+// plus the EMAILJS_PRIVATE_KEY and VAPID_* secrets.
 
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 import webpush from 'npm:web-push@3.6.7';
 
-// ---------------- Config I might want to tweak later ----------------
+// ---------------- Config ----------------
 
-// My org's single timezone, expressed as an offset from UTC in minutes.
-// I'm assuming one timezone for the whole company here, since that's
-// what I actually have today. Accra doesn't observe daylight saving, so
-// this stays constant year-round — if I ever hire outside Ghana, this
-// needs to become a per-employee value instead of one constant.
-const ORG_UTC_OFFSET_MINUTES = 0; // Africa/Accra is UTC+0 all year
+// Org timezone as a UTC offset in minutes. One timezone for everyone for now,
+// would need to be per-employee if I hire outside Ghana.
+const ORG_UTC_OFFSET_MINUTES = 0; // Africa/Accra, UTC+0 all year
 
-// How long after someone's expected clock-in time I wait before I call
-// it "missed" — this is the 15-minute grace period from my second idea.
+// Grace period before a clock-in counts as missed.
 const MISSED_CLOCK_IN_GRACE_MINUTES = 15;
 
-// Days I skip the missed-clock-in check on (JS getUTCDay(): 0 = Sun,
-// 6 = Sat). I don't have a per-employee work-schedule concept yet, so
-// this is a single org-wide assumption — worth revisiting if that's
-// wrong for some of my staff.
+// Days with no missed-clock-in check (getUTCDay(): 0 = Sun, 6 = Sat). Org-wide
+// for now, no per-employee schedules yet.
 const NON_WORKING_DAYS = [0, 6];
 
 const supabase = createClient(
@@ -55,19 +32,14 @@ const supabase = createClient(
   Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
 );
 
-// Same EmailJS service/template Dashboard.js already sends through, so
-// an email from this function looks identical to one sent from an open
-// tab.
+// Same EmailJS service/template as Dashboard.js.
 const EMAILJS_SERVICE_ID = 'service_qo5r5ol';
 const EMAILJS_TEMPLATE_ID = 'template_iyjajm8';
 const EMAILJS_PUBLIC_KEY = 'EWbasKvfwG1WXLCuA';
-// I'm keeping the private key out of source and reading it from a
-// function secret instead:
+// Private key from a function secret, not in source:
 //   supabase secrets set EMAILJS_PRIVATE_KEY=xxxxx
-// (found in the EmailJS dashboard under Account > API Keys). EmailJS
-// needs this to accept a send request that isn't coming from my
-// registered site origin, which is exactly what a server-to-server call
-// from this function is.
+// (EmailJS dashboard > Account > API Keys). Needed because this call doesn't
+// come from the registered site origin.
 const EMAILJS_PRIVATE_KEY = Deno.env.get('EMAILJS_PRIVATE_KEY');
 
 async function sendEmail(toEmail: string, toName: string, title: string, message: string) {
@@ -101,11 +73,8 @@ async function sendEmail(toEmail: string, toName: string, title: string, message
   }
 }
 
-// These three are the VAPID credentials I generated once with
-// `npx web-push generate-vapid-keys` and stored as function secrets —
-// see supabase secrets set VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY /
-// VAPID_SUBJECT. They're what let a browser trust that a push actually
-// came from my server and nobody else's.
+// VAPID keys from `npx web-push generate-vapid-keys`, stored as secrets
+// (VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY / VAPID_SUBJECT).
 const VAPID_PUBLIC_KEY = Deno.env.get('VAPID_PUBLIC_KEY');
 const VAPID_PRIVATE_KEY = Deno.env.get('VAPID_PRIVATE_KEY');
 const VAPID_SUBJECT = Deno.env.get('VAPID_SUBJECT');
@@ -114,12 +83,8 @@ if (VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY && VAPID_SUBJECT) {
   webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
 }
 
-// Sends a desktop push to every browser this employee has enabled
-// notifications on (there can be more than one — see
-// push_subscriptions in PUSH_SUBSCRIPTIONS_SCHEMA.sql). If they've
-// never enabled it anywhere, there are simply no rows for their
-// user_id, and this quietly does nothing — that's expected, not an
-// error, since push is opt-in per browser.
+// Push to every browser the employee enabled (push_subscriptions). No rows =
+// never enabled, nothing to send.
 async function sendPush(userId: string, title: string, body: string, tag: string) {
   if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY || !VAPID_SUBJECT) {
     console.log('[reminder-sweep] VAPID secrets not set — skipping push for', userId);
@@ -150,11 +115,7 @@ async function sendPush(userId: string, title: string, body: string, tag: string
         .update({ last_seen_at: new Date().toISOString() })
         .eq('id', sub.id);
     } catch (err: any) {
-      // A 404 or 410 here means the browser itself has told us this
-      // subscription is dead — the person uninstalled/cleared data,
-      // the browser expired it, whatever the reason. I'm removing it
-      // rather than leaving it to fail the same way every 5 minutes
-      // forever.
+      // 404/410 = dead subscription. Remove it so it doesn't fail every run.
       if (err && (err.statusCode === 404 || err.statusCode === 410)) {
         console.log('[reminder-sweep] Removing expired push subscription', sub.id);
         await supabase.from('push_subscriptions').delete().eq('id', sub.id);
@@ -174,10 +135,8 @@ function secondsToHms(totalSeconds: number) {
   return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`;
 }
 
-// This mirrors the worked-seconds math in
-// Dashboard.js/applyServerClockState on purpose — I want this function
-// to agree with what the employee's own screen would show, not invent a
-// second definition of "how long have I worked".
+// Same worked-seconds maths as applyServerClockState in Dashboard.js so both
+// show the same time.
 function workedSecondsFor(status: any, now: Date) {
   const clockInAt = status.clock_in_at ? new Date(status.clock_in_at).getTime() : now.getTime();
   const breakAccum = status.break_accum_seconds || 0;
@@ -210,7 +169,7 @@ async function sweepBreakAndClockOutReminders(now: Date) {
 
   for (const status of statuses) {
     const profile = profileById.get(status.user_id);
-    if (!profile) continue; // no matching profile — nothing to email
+    if (!profile) continue; // no profile, nothing to email
 
     const worked = workedSecondsFor(status, now);
     const updates: Record<string, any> = {};
@@ -243,11 +202,9 @@ async function sweepBreakAndClockOutReminders(now: Date) {
       await sendPush(status.user_id, 'Mmer3 — Automatic Clock-Out',
         'You\u2019ve reached 8 hours 15 minutes, so Mmer3 has automatically clocked you out.', 'auto-clock-out');
 
-      // I'm performing the actual auto clock-out here, for real, since
-      // this function is the one place in the whole app that now
-      // reliably runs regardless of whether any tab is open. This
-      // mirrors handleAdminClockOut in AdminDashboard.js: write the
-      // finished session to records, then reset employee_status.
+      // Auto clock-out, same steps as handleAdminClockOut: save the record,
+      // reset employee_status. Location comes from employee_status (was
+      // hardcoded to 'unavailable', which showed N/A).
       const clockInAt = status.clock_in_at ? new Date(status.clock_in_at) : now;
       const totalSeconds = Math.max(0, Math.round((now.getTime() - clockInAt.getTime()) / 1000) - (status.break_accum_seconds || 0));
 
@@ -258,7 +215,7 @@ async function sweepBreakAndClockOutReminders(now: Date) {
         clock_out: now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
         hours_worked: secondsToHms(totalSeconds),
         break_time: secondsToHms(status.break_accum_seconds || 0),
-        location_status: 'unavailable',
+        location_status: status.location_status || 'unavailable',
         adjusted_by_admin: false
       }]);
 
@@ -266,6 +223,9 @@ async function sweepBreakAndClockOutReminders(now: Date) {
       updates.clock_in_at = null;
       updates.break_started_at = null;
       updates.break_accum_seconds = 0;
+      // Only if the column exists, so the update can't fail and leave them
+      // clocked in before location_status.sql is run.
+      if ('location_status' in status) updates.location_status = null;
     }
 
     if (Object.keys(updates).length > 0) {
@@ -276,14 +236,9 @@ async function sweepBreakAndClockOutReminders(now: Date) {
 }
 
 async function sweepMissedClockIn(now: Date) {
-  // I want "today" and "now" in my org's timezone, not the server's
-  // (which runs in UTC) — otherwise an 8am Accra threshold would fire
-  // at the wrong wall-clock moment. Since Accra is UTC+0 all year, this
-  // is a no-op today, but it's here so the offset constant above
-  // actually does something the day I change it. The trick: shift the
-  // real UTC time by my offset, then read it back with the UTC getters
-  // — that gives me "local" wall-clock values without needing a
-  // timezone database.
+  // "today"/"now" in the org timezone, not the server's UTC. Shift by the
+  // offset then read with the UTC getters. No-op for Accra but ready if the
+  // offset changes.
   const localNow = new Date(now.getTime() + ORG_UTC_OFFSET_MINUTES * 60000);
   const dayOfWeek = localNow.getUTCDay();
   if (NON_WORKING_DAYS.includes(dayOfWeek)) return;
@@ -302,8 +257,7 @@ async function sweepMissedClockIn(now: Date) {
   }
   if (!profiles || profiles.length === 0) return;
 
-  // Only people who've opted into this reminder (the toggle already on
-  // the Reminders page) and who I haven't already notified today.
+  // Only people who turned this reminder on and haven't been notified today.
   const candidates = profiles.filter((p: any) =>
     p.optional_reminders && p.optional_reminders.missedClockIn &&
     p.missed_clock_in_notified_date !== todayIso
@@ -330,11 +284,9 @@ async function sweepMissedClockIn(now: Date) {
     if (onLeaveIds.has(profile.id)) continue;
 
     const status = statusById.get(profile.id);
-    // Already clocked in (or on break, or clocked out) TODAY — not
-    // missed. I'm comparing dates here rather than just checking
-    // status !== 'not_clocked_in', for the same reason I fixed
-    // AdminDashboard.js/getStatus: a stale 'clocked_out' from a
-    // previous day shouldn't count as "already handled today".
+    // Already clocked in/out today, not missed. Checking the date because a
+    // stale 'clocked_out' from another day doesn't count (same as getStatus in
+    // AdminDashboard.js).
     if (status) {
       const relevantAt = status.clock_in_at || status.updated_at;
       const relevantDateIso = relevantAt
@@ -348,7 +300,7 @@ async function sweepMissedClockIn(now: Date) {
     const deadline = new Date(localNow);
     deadline.setUTCHours(expH, expM + MISSED_CLOCK_IN_GRACE_MINUTES, 0, 0);
 
-    if (localNow.getTime() < deadline.getTime()) continue; // grace period isn't up yet
+    if (localNow.getTime() < deadline.getTime()) continue; // grace period not up yet
 
     await sendEmail(profile.email, profile.full_name, 'Missed Clock-In — Mmerℇ',
       `It's past ${expected.slice(0, 5)} and I don't see you clocked in yet today. If this is expected (leave, a late start, etc.) you can ignore this.`);

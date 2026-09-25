@@ -27,9 +27,7 @@
   background: var(--blue-700);
 }
 
-/* The widget floats above every page and theme, so it deliberately
-   keeps its own light card look rather than tracking the dashboard's
-   dark mode state — one less thing to keep in sync. */
+/* Always light, doesn't follow dark mode */
 .ai-chat-panel {
   width: 320px;
   max-width: calc(100vw - 40px);

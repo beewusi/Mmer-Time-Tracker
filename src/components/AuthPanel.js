@@ -1,9 +1,8 @@
 import AnimatedHourglass from './AnimatedHourglass';
 import './AuthPanel.css';
 
-// The dark left-hand panel shared by Login, SignUp and ResetPassword.
-// Copy (tagline/sub text) is passed in as children so each page keeps
-// its own exact wording untouched.
+// Dark left panel for Login, SignUp and ResetPassword. Text comes in as
+// children.
 function AuthPanel({ children }) {
   return (
     <div className="auth-panel">

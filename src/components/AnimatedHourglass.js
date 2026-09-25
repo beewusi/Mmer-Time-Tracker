@@ -1,7 +1,6 @@
 import './AnimatedHourglass.css';
 
-// A bigger, animated stand-in for the small static HourglassIcon used
-// elsewhere in the app. Pure SVG + CSS keyframes — no animation library.
+// Animated version of HourglassIcon. SVG + CSS keyframes, no library.
 function AnimatedHourglass({ size = 56 }) {
   return (
     <svg

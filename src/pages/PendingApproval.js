@@ -2,9 +2,8 @@ import AuthPanel from '../components/AuthPanel';
 import { ClockIcon, XIcon } from '../icons';
 import './PendingApproval.css';
 
-// Shown after a successful sign-in/sign-up when the profile's `status`
-// isn't 'approved' yet. Covers both fresh sign-ups awaiting review and
-// accounts an admin has rejected.
+// Shown when profiles.status isn't 'approved' yet (waiting for review or
+// rejected).
 function PendingApproval({ status, onLogout, onRefresh }) {
   const isRejected = status === 'rejected';
 

@@ -654,7 +654,7 @@
   border: var(--border);
   border-radius: var(--radius-md);
   box-shadow: var(--shadow-card);
-  overflow: hidden;
+  overflow-x: auto;
 }
 
 .timesheet-table {
@@ -697,6 +697,7 @@
 .location-tag-authorised { background: var(--success-bg); color: var(--success); }
 .location-tag-unauthorised { background: var(--danger-bg); color: var(--danger); }
 .location-tag-unavailable { background: var(--gray-100); color: var(--gray-500); }
+.location-tag-declined { background: var(--gray-100); color: var(--danger); text-decoration: line-through; }
 
 /* ---------- Time off ---------- */
 .form-alert {
@@ -1080,8 +1081,7 @@
   background: var(--navy);
 }
 
-/* The sidebar keeps its own, lighter shade in dark mode so it stays a
-   clearly distinct panel instead of blending into the page background. */
+/* Lighter sidebar shade in dark mode so it doesn't blend into the page */
 .dashboard-layout.dark .sidebar {
   background: var(--navy-700);
   border-right: 1px solid rgba(248, 250, 252, 0.08);
@@ -1223,6 +1223,7 @@
 @media (max-width: 1180px) {
   .page {
     max-width: 100%;
+    padding: var(--space-5) var(--space-4);
   }
 }
 
@@ -1238,10 +1239,12 @@
   }
 }
 
-@media (max-width: 780px) {
+/* Below 900px: sidebar becomes a top bar, nav drops down from the menu button */
+@media (max-width: 900px) {
   .dashboard-layout {
     flex-direction: column;
     height: auto;
+    min-height: 100vh;
     overflow: visible;
   }
   .main-content {
@@ -1249,11 +1252,55 @@
     overflow: visible;
   }
   .sidebar {
+    position: sticky;
+    top: 0;
+    z-index: 900;
     width: 100%;
     height: auto;
+    overflow: visible;
+    padding: 12px var(--space-3);
   }
+  .sidebar-top {
+    align-items: center;
+  }
+  .sidebar-brand {
+    margin-bottom: 0;
+  }
+  .sidebar-menu-toggle {
+    display: inline-flex;
+  }
+  .sidebar-collapsible {
+    display: none;
+    position: absolute;
+    top: 100%;
+    left: 0;
+    right: 0;
+    max-height: calc(100vh - 62px);
+    overflow-y: auto;
+    background: inherit;
+    padding: var(--space-2) var(--space-3) var(--space-3);
+    border-top: 1px solid rgba(248, 250, 252, 0.08);
+    box-shadow: 0 12px 24px rgba(15, 23, 42, 0.25);
+  }
+  .sidebar.nav-open .sidebar-collapsible {
+    display: flex;
+  }
+  .sidebar-backdrop {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: 850;
+    background: rgba(15, 23, 42, 0.35);
+  }
+  .dashboard-layout.dark .sidebar {
+    border-right: none;
+    border-bottom: 1px solid rgba(248, 250, 252, 0.08);
+  }
+}
+
+@media (max-width: 780px) {
   .page {
-    padding: var(--space-4);
+    padding: var(--space-4) var(--space-3);
   }
   .bottom-card-header-row {
     flex-wrap: wrap;
@@ -1266,18 +1313,76 @@
     align-items: flex-start;
     gap: 4px;
   }
+  .activities-content {
+    flex-direction: column;
+    align-items: center;
+  }
+  .timesheet-controls {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .timesheet-view-toggle {
+    overflow-x: auto;
+  }
+  .timesheet-view-btn {
+    flex: 1;
+    white-space: nowrap;
+  }
+  .timesheet-month-nav {
+    justify-content: space-between;
+  }
+  .timesheet-month-label {
+    min-width: 0;
+    flex: 1;
+  }
+  .timesheet-table {
+    min-width: 620px;
+  }
 }
 
 @media (max-width: 480px) {
   .page {
-    padding: var(--space-3);
+    padding: var(--space-3) 12px;
+  }
+  .page-header h1 {
+    font-size: 20px;
   }
   .card-timer {
     font-size: 34px;
   }
+  .card-buttons {
+    flex-wrap: wrap;
+  }
+  .timesheet-calendar-card,
+  .timesheet-week-card,
+  .timesheet-day-detail {
+    padding: 12px;
+  }
+  .timesheet-calendar-grid,
+  .timesheet-calendar-weekdays,
+  .timesheet-week-card {
+    gap: 3px;
+  }
+  .timesheet-day-cell {
+    aspect-ratio: auto;
+    min-height: 44px;
+    padding: 3px 1px;
+  }
+  .timesheet-day-hours {
+    font-size: 9px;
+  }
+  .timesheet-calendar-weekdays span {
+    font-size: 9.5px;
+  }
+  .timesheet-week-cell {
+    padding: 10px 1px;
+  }
+  .timesheet-week-dayname {
+    font-size: 9px;
+  }
 }
 
-/* ---------- Timesheet page: calendar view (mirrors AdminDashboard.css) ---------- */
+/* ---------- Timesheet page: calendar view (same as AdminDashboard.css) ---------- */
 .timesheet-controls {
   display: flex;
   align-items: center;
@@ -1604,4 +1709,61 @@
 
 .dashboard-layout.dark .timesheet-day-record {
   border-top-color: rgba(248, 250, 252, 0.1);
+}
+
+/* ---------- FAQ ---------- */
+.faq-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.faq-item {
+  background: #FFFFFF;
+  border: var(--border);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+
+.faq-question {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  background: none;
+  border: none;
+  text-align: left;
+  padding: var(--space-3) var(--space-4);
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--navy-700);
+  cursor: pointer;
+}
+
+.faq-toggle {
+  font-size: 18px;
+  color: var(--gray-400);
+  flex-shrink: 0;
+}
+
+.faq-answer {
+  padding: 0 var(--space-4) var(--space-3);
+  font-size: 13.5px;
+  color: var(--gray-600);
+  line-height: 1.6;
+  margin: 0;
+}
+
+.dashboard-layout.dark .faq-item {
+  background: var(--navy-700);
+  border-color: rgba(248, 250, 252, 0.1);
+}
+
+.dashboard-layout.dark .faq-question {
+  color: var(--white);
+}
+
+.dashboard-layout.dark .faq-answer {
+  color: var(--gray-300);
 }

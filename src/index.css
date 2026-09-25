@@ -1,6 +1,4 @@
-/* Global design tokens for Mmerℇ.
-   Palette kept to three brand colors + a neutral scale,
-   per the new design direction. */
+/* Global design tokens. Three brand colors + a neutral scale. */
 
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap');
 
@@ -78,7 +76,7 @@ button {
   font-family: inherit;
 }
 
-/* Visible focus state, kept consistent across the app */
+/* Focus state for the whole app */
 button:focus-visible,
 input:focus-visible,
 [tabindex]:focus-visible {
@@ -100,16 +98,43 @@ input:focus-visible,
   font-weight: 600;
 }
 
-.test-mode-ribbon {
-  position: sticky;
-  top: 0;
-  z-index: 999;
-  width: 100%;
-  text-align: center;
-  background: var(--navy);
+
+/* ---------- Collapsible sidebar (shared by the employee and admin sidebars) ---------- */
+/* Menu button + backdrop only show below 900px (rules in Dashboard.css / AdminDashboard.css) */
+.sidebar-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.sidebar-collapsible {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+
+.sidebar-menu-toggle {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  width: 38px;
+  height: 38px;
+  flex-shrink: 0;
+  background: transparent;
+  border: 1px solid rgba(248, 250, 252, 0.15);
+  color: var(--gray-300);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.sidebar-menu-toggle:hover {
+  border-color: var(--gray-300);
   color: var(--white);
-  font-size: 12.5px;
-  font-weight: 600;
-  letter-spacing: 0.2px;
-  padding: 7px 12px;
+}
+
+.sidebar-backdrop {
+  display: none;
 }

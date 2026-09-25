@@ -1,59 +1,27 @@
 import { useState, useEffect } from 'react';
 import { supabase } from '../supabase';
-import {
-  TEST_MODE, getEmployees, getAllRecords, updateRecord,
-  getAllTimeOffRequests, updateTimeOffStatus,
-  getAllEmployeeStatuses, adminClockIn, adminStartBreak, adminEndBreak, adminClockOut,
-  getAdminSettings, setAdminSettings,
-  getPendingEmployees, approveEmployee, rejectEmployee, updateEmployeeDetails,
-  getTimesheetApproval, setTimesheetApproval
-} from '../mockData';
 import { callAI } from '../lib/ai';
 import './AdminDashboard.css';
 import {
   HourglassIcon, UsersIcon, RefreshIcon, LogoutIcon, TimesheetIcon,
-  SuitcaseIcon, HelpIcon, ClockIcon, CoffeeIcon, CheckCircleIcon, XIcon,
-  SettingsIcon, PinIcon, UserIcon, MoonIcon, SunIcon
+  SuitcaseIcon, ClockIcon, CoffeeIcon, CheckCircleIcon, XIcon,
+  SettingsIcon, PinIcon, UserIcon, MoonIcon, SunIcon, MenuIcon
 } from '../icons';
 
-const FAQ_ITEMS = [
-  {
-    q: 'How does an employee clock in or out?',
-    a: 'From their dashboard, employees use the Clock In button on the Clock In card. Location is checked against the office radius — clocking in from an unauthorised location is blocked automatically.'
-  },
-  {
-    q: 'What happens if someone forgets to clock out?',
-    a: 'They are reminded after 3 hours and 8 hours of work, and automatically clocked out after 8 hours 15 minutes. If a session still looks wrong afterwards, use the Clock Out action on their profile in the Employees tab to correct it.'
-  },
-  {
-    q: 'How do I approve a new sign-up?',
-    a: 'Open the Approvals tab. Every new sign-up (including Google sign-ups) sits there until you type in a department and click Approve — they can\u2019t sign in until then. Click Reject to turn one down instead.'
-  },
-  {
-    q: 'How do I approve time off requests?',
-    a: 'Open the Time Off tab. Approve or reject requests individually, or tick several pending requests and use the bulk actions above the list to approve or reject them all at once.'
-  },
-  {
-    q: 'Can I correct a timesheet entry?',
-    a: 'Yes — open the Timesheets tab, click Edit on the relevant row, adjust the clock in/out, break time or hours worked, then save.'
-  },
-  {
-    q: 'How do I clock an employee in, out, or onto a break myself?',
-    a: 'Open the Employees tab and click on any employee row to open their profile card, which has Clock In, Start Break, End Break and Clock Out actions depending on their current status.'
-  },
-  {
-    q: 'What do the location tags on a timesheet mean?',
-    a: 'Authorised means the clock-in happened within the allowed radius of the office. Unauthorised means it was outside that radius. N/A means location data wasn\u2019t available at the time.'
-  },
-  {
-    q: 'Where does the AI come in?',
-    a: 'It drafts the message sent to an employee when their time off request is approved or rejected, it can flag a timesheet entry worth a second look (the app decides what counts as unusual — the AI just phrases the note), and it powers the assistant on the employee side. See AI_FEATURES.md for the full list.'
-  }
-];
-
-// Kept as a fallback list so the department picker offers something even
-// before any employee has been assigned one yet.
+// Starter departments for the picker.
 const DEFAULT_DEPARTMENT_SUGGESTIONS = ['Operations', 'Finance', 'Human Resources', 'Sales', 'Engineering'];
+
+function locationLabel(status) {
+  if (status === 'authorised') return 'Authorised';
+  if (status === 'unauthorised') return 'Unauthorised';
+  if (status === 'declined') return 'Declined';
+  return 'N/A';
+}
+
+// Declined sessions stay on the timesheet but don't count towards hours.
+function isCounted(record) {
+  return record.location_status !== 'declined';
+}
 
 function AdminDashboard({ user, onLogout }) {
   const [employees, setEmployees] = useState([]);
@@ -97,7 +65,6 @@ function AdminDashboard({ user, onLogout }) {
   const [approvalSaving, setApprovalSaving] = useState(false);
 
   const [selectedTimeOffIds, setSelectedTimeOffIds] = useState([]);
-  const [openFaqIndex, setOpenFaqIndex] = useState(null);
   const [adminSettings, setAdminSettingsState] = useState({ locationAlerts: true });
   const [processingTimeOffId, setProcessingTimeOffId] = useState(null);
   const [bulkProcessing, setBulkProcessing] = useState(false);
@@ -105,14 +72,16 @@ function AdminDashboard({ user, onLogout }) {
   const [anomalyLoadingId, setAnomalyLoadingId] = useState(null);
   const [isDarkMode, setIsDarkMode] = useState(false);
   const [liveTick, setLiveTick] = useState(Date.now());
+  const [isNavOpen, setIsNavOpen] = useState(false);
+  const [locationSavingId, setLocationSavingId] = useState(null);
 
   useEffect(() => {
     loadData();
     loadAdminSettings();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Defaults the Timesheets tab to the first employee once the list is
-  // in, rather than leaving it blank until the admin picks someone.
+  // Default the Timesheets tab to the first employee.
   useEffect(() => {
     if (!timesheetEmployeeId && employees.length > 0) {
       setTimesheetEmployeeId(employees[0].id);
@@ -128,10 +97,6 @@ function AdminDashboard({ user, onLogout }) {
   }, [timesheetEmployeeId, timesheetMonthDate]);
 
   async function loadAdminSettings() {
-    if (TEST_MODE) {
-      setAdminSettingsState(getAdminSettings());
-      return;
-    }
     const { data, error } = await supabase
       .from('app_settings')
       .select('location_alerts')
@@ -143,9 +108,8 @@ function AdminDashboard({ user, onLogout }) {
     }
   }
 
-  // Ticks once a second only while the modal is open on someone who's
-  // currently clocked in or on break, so the admin can watch their break
-  // (or work) time count up live instead of seeing a static badge.
+  // Live timer for the modal, only while that employee is clocked in or on
+  // break.
   useEffect(() => {
     if (!selectedEmployee) return undefined;
     const status = getStatus(selectedEmployee.id);
@@ -156,22 +120,17 @@ function AdminDashboard({ user, onLogout }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedEmployee, employeeStatuses]);
 
-  // Keeps the admin's view current without needing a manual refresh —
-  // catches new sign-ups, time off requests, and clocked-in/out records
-  // from any employee. The employee_status table already pushes live via
-  // the realtime subscription below; this covers everything else.
+  // Poll every 30s for sign-ups, time off and new records. employee_status
+  // comes through realtime below.
   useEffect(() => {
-    if (TEST_MODE) return undefined;
     const interval = setInterval(() => loadData(true), 30000);
     return () => clearInterval(interval);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Live status updates from any employee, on any device, push straight
-  // into this tab — no manual refresh needed. Only relevant once
-  // TEST_MODE is off and the employee_status table actually exists.
+  // Realtime employee_status updates (clock in/out, breaks, unauthorised
+  // clock-ins).
   useEffect(() => {
-    if (TEST_MODE) return undefined;
-
     const channel = supabase
       .channel('admin-employee-status')
       .on('postgres_changes', { event: '*', schema: 'public', table: 'employee_status' }, () => {
@@ -200,10 +159,6 @@ function AdminDashboard({ user, onLogout }) {
   }
 
   async function refreshStatuses() {
-    if (TEST_MODE) {
-      setEmployeeStatuses(getAllEmployeeStatuses());
-      return;
-    }
     const { data } = await supabase.from('employee_status').select('*');
     const map = {};
     (data || []).forEach(row => { map[row.user_id] = row; });
@@ -212,16 +167,6 @@ function AdminDashboard({ user, onLogout }) {
 
   async function loadData(silent = false) {
     if (!silent) setLoading(true);
-
-    if (TEST_MODE) {
-      setEmployees(getEmployees().filter(e => (e.status || 'approved') === 'approved'));
-      setPendingUsers(getPendingEmployees());
-      setRecords(getAllRecords());
-      setAllTimeOff(getAllTimeOffRequests());
-      await refreshStatuses();
-      if (!silent) setLoading(false);
-      return;
-    }
 
     const { data: profiles } = await supabase
       .from('profiles')
@@ -268,14 +213,11 @@ function AdminDashboard({ user, onLogout }) {
     return d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
   }
 
-  function getEmployeeName(userId) {
+  // savedName = employee_name kept on the row after an employee is deleted.
+  function getEmployeeName(userId, savedName) {
     const emp = employees.find(e => e.id === userId);
-    return emp ? (emp.full_name || emp.email) : 'Unknown employee';
-  }
-
-  function getEmployeeEmail(userId) {
-    const emp = employees.find(e => e.id === userId);
-    return emp ? emp.email : null;
+    if (emp) return emp.full_name || emp.email;
+    return savedName ? `${savedName} (deleted)` : 'Unknown employee';
   }
 
   function hoursStringToSeconds(str) {
@@ -284,10 +226,9 @@ function AdminDashboard({ user, onLogout }) {
     return (parts[0] || 0) * 3600 + (parts[1] || 0) * 60 + (parts[2] || 0);
   }
 
-  // Plain maths decides whether a day looks unusual for this employee —
-  // the AI is only ever asked to phrase the note, never to judge the number.
+  // Unusual hours are worked out here. The assistant only words the note.
   function getHoursAnomaly(userId) {
-    const employeeRecords = records.filter(r => r.user_id === userId);
+    const employeeRecords = records.filter(r => r.user_id === userId && isCounted(r));
     if (employeeRecords.length < 2) return null;
 
     const sorted = [...employeeRecords].sort((a, b) => {
@@ -302,7 +243,7 @@ function AdminDashboard({ user, onLogout }) {
     if (averageSeconds === 0) return null;
 
     const diffRatio = Math.abs(latestSeconds - averageSeconds) / averageSeconds;
-    if (diffRatio < 0.35) return null; // close enough to normal — nothing to flag
+    if (diffRatio < 0.35) return null; // close enough, nothing to flag
 
     return {
       date: latest.date,
@@ -319,7 +260,7 @@ function AdminDashboard({ user, onLogout }) {
   }
 
   function getTotalHoursToday(userId) {
-    const todayRecords = getTodayRecords(userId);
+    const todayRecords = getTodayRecords(userId).filter(isCounted);
     if (todayRecords.length === 0) return '00:00:00';
 
     let totalSeconds = 0;
@@ -354,14 +295,8 @@ function AdminDashboard({ user, onLogout }) {
     if (liveStatus === 'clocked_in' || liveStatus === 'on_break') return liveStatus;
     if (isOnLeaveToday(userId)) return 'on_leave';
 
-    // I found that 'clocked_out' was sticking around forever once it was
-    // set — employee_status is one row per employee, not one row per
-    // day, so if someone clocked out yesterday (or last week) and hasn't
-    // clocked in again since, this used to still read 'clocked_out' here,
-    // which reads as "finished today's shift" when really they haven't
-    // started today at all. I only want to trust a 'clocked_out' status
-    // if it was actually set today; otherwise I'm treating it the same
-    // as never having clocked in.
+    // employee_status is one row per employee, so an old 'clocked_out' would
+    // show as today's. Only trust it if it was set today.
     if (liveStatus === 'clocked_out') {
       const updatedAt = record.updated_at;
       const setToday = updatedAt
@@ -389,9 +324,7 @@ function AdminDashboard({ user, onLogout }) {
     return 'muted';
   }
 
-  // Live break/work duration for the modal — recomputed every second via
-  // the liveTick effect above, using the same clock_in_at/break_started_at
-  // data the employee's own device writes to employee_status.
+  // Live work/break time for the modal, updated by liveTick.
   function getLiveDuration(userId) {
     const s = employeeStatuses[userId];
     if (!s) return null;
@@ -428,14 +361,10 @@ function AdminDashboard({ user, onLogout }) {
 
     setPendingActionId(pendingUser.id);
 
-    if (TEST_MODE) {
-      approveEmployee(pendingUser.id, department);
-    } else {
-      await supabase
-        .from('profiles')
-        .update({ status: 'approved', department })
-        .eq('id', pendingUser.id);
-    }
+    await supabase
+      .from('profiles')
+      .update({ status: 'approved', department })
+      .eq('id', pendingUser.id);
 
     await loadData();
     setPendingActionId(null);
@@ -445,20 +374,15 @@ function AdminDashboard({ user, onLogout }) {
     setPendingActionId(pendingUser.id);
     setApprovalsError('');
 
-    if (TEST_MODE) {
-      rejectEmployee(pendingUser.id);
-    } else {
-      // Deletes the auth account too, not just the profiles row — see
-      // supabase/functions/admin-reject-user — so the email is fully
-      // free for that person to sign up again if needed.
-      const { data, error } = await supabase.functions.invoke('admin-reject-user', {
-        body: { userId: pendingUser.id }
-      });
-      if (error || data?.error) {
-        setApprovalsError(data?.error || 'Could not reject this account. Please try again.');
-        setPendingActionId(null);
-        return;
-      }
+    // Deletes the auth account + profile (admin-reject-user) so the email can
+    // sign up again.
+    const { data, error } = await supabase.functions.invoke('admin-reject-user', {
+      body: { userId: pendingUser.id }
+    });
+    if (error || data?.error) {
+      setApprovalsError(data?.error || 'Could not reject this account. Please try again.');
+      setPendingActionId(null);
+      return;
     }
 
     await loadData();
@@ -488,18 +412,14 @@ function AdminDashboard({ user, onLogout }) {
     setSavingFullDetails(true);
     setFullDetailsError('');
 
-    if (TEST_MODE) {
-      updateEmployeeDetails(fullDetailsEmployee.id, { full_name: name, department });
-    } else {
-      const { error } = await supabase
-        .from('profiles')
-        .update({ full_name: name, department })
-        .eq('id', fullDetailsEmployee.id);
-      if (error) {
-        setFullDetailsError('Failed to save changes. Please try again.');
-        setSavingFullDetails(false);
-        return;
-      }
+    const { error } = await supabase
+      .from('profiles')
+      .update({ full_name: name, department })
+      .eq('id', fullDetailsEmployee.id);
+    if (error) {
+      setFullDetailsError('Failed to save changes. Please try again.');
+      setSavingFullDetails(false);
+      return;
     }
 
     setSelectedEmployee(prev => prev && prev.id === fullDetailsEmployee.id ? { ...prev, full_name: name, department } : prev);
@@ -517,20 +437,15 @@ function AdminDashboard({ user, onLogout }) {
   async function performDelete(employee) {
     setDeletingEmployeeId(employee.id);
 
-    if (TEST_MODE) {
-      rejectEmployee(employee.id); // test-mode stand-in: marks them removed
-    } else {
-      // Same edge function used to fully remove a rejected sign-up — it
-      // just deletes the auth account + profile row by id, whether the
-      // person was pending or already approved.
-      const { data, error } = await supabase.functions.invoke('admin-reject-user', {
-        body: { userId: employee.id }
-      });
-      if (error || data?.error) {
-        setDeleteConfirmError(data?.error || 'Could not delete this account. Please try again.');
-        setDeletingEmployeeId(null);
-        return;
-      }
+    // Same edge function as rejecting a sign-up. Deletes auth account +
+    // profile.
+    const { data, error } = await supabase.functions.invoke('admin-reject-user', {
+      body: { userId: employee.id }
+    });
+    if (error || data?.error) {
+      setDeleteConfirmError(data?.error || 'Could not delete this account. Please try again.');
+      setDeletingEmployeeId(null);
+      return;
     }
 
     setSelectedEmployee(null);
@@ -540,17 +455,9 @@ function AdminDashboard({ user, onLogout }) {
     setDeletingEmployeeId(null);
   }
 
-  // Re-checks the admin's own password before a delete actually goes
-  // through — the confirm dialog alone can be clicked through by accident
-  // (or by anyone left at an unlocked, still-logged-in session); typing
-  // the password is a deliberate second step only the real admin can do.
+  // Admin password re-entered before a delete.
   async function submitDeleteConfirm() {
     if (!deleteConfirmEmployee) return;
-
-    if (TEST_MODE) {
-      await performDelete(deleteConfirmEmployee);
-      return;
-    }
 
     if (!deleteConfirmPassword) {
       setDeleteConfirmError('Enter your password to confirm.');
@@ -589,106 +496,98 @@ function AdminDashboard({ user, onLogout }) {
   const totalNotClockedIn = employees.length - totalClockedIn - totalOnBreak - totalClockedOut - totalOnLeave;
 
   // ---------- Employee status overrides ----------
-  // TEST_MODE keeps using the existing localStorage-backed mockData
-  // functions unchanged; the else branch is the real, multi-device
-  // Supabase path against the employee_status table.
+
+  // Retries without location_status if the column isn't there yet
+  // (supabase/location_status.sql).
+  async function upsertEmployeeStatus(row) {
+    const { error } = await supabase.from('employee_status').upsert(row);
+    if (error && String(error.message || '').includes('location_status')) {
+      const withoutLocation = { ...row };
+      delete withoutLocation.location_status;
+      await supabase.from('employee_status').upsert(withoutLocation);
+    }
+  }
 
   async function handleAdminClockIn(employeeId) {
-    if (TEST_MODE) {
-      adminClockIn(employeeId);
-    } else {
-      // I'm resetting the server-side reminder-sent flags here too — this
-      // is a fresh session, and reminder-sweep (the cron job) needs to be
-      // free to send this employee's 2hr/3hr/8hr reminders again even
-      // though I'm the one who clocked them in, not them.
-      await supabase.from('employee_status').upsert({
-        user_id: employeeId,
-        status: 'clocked_in',
-        clock_in_at: new Date().toISOString(),
-        break_started_at: null,
-        break_accum_seconds: 0,
-        break_2h_sent: false,
-        break_3h_sent: false,
-        clock_out_8h_sent: false,
-        auto_clock_out_sent: false,
-        updated_at: new Date().toISOString()
-      });
-    }
+    // Fresh session: reminder-sent flags reset for reminder-sweep. Marked
+    // authorised since the admin did the clock-in.
+    await upsertEmployeeStatus({
+      user_id: employeeId,
+      status: 'clocked_in',
+      clock_in_at: new Date().toISOString(),
+      break_started_at: null,
+      break_accum_seconds: 0,
+      location_status: 'authorised',
+      break_2h_sent: false,
+      break_3h_sent: false,
+      clock_out_8h_sent: false,
+      auto_clock_out_sent: false,
+      updated_at: new Date().toISOString()
+    });
     await refreshStatuses();
   }
 
   async function handleAdminStartBreak(employeeId) {
-    if (TEST_MODE) {
-      adminStartBreak(employeeId);
-    } else {
-      const { data: current } = await supabase
-        .from('employee_status').select('*').eq('user_id', employeeId).maybeSingle();
-      await supabase.from('employee_status').upsert({
-        user_id: employeeId,
-        status: 'on_break',
-        clock_in_at: current?.clock_in_at || new Date().toISOString(),
-        break_started_at: new Date().toISOString(),
-        break_accum_seconds: current?.break_accum_seconds || 0,
-        updated_at: new Date().toISOString()
-      });
-    }
+    const { data: current } = await supabase
+      .from('employee_status').select('*').eq('user_id', employeeId).maybeSingle();
+    await supabase.from('employee_status').upsert({
+      user_id: employeeId,
+      status: 'on_break',
+      clock_in_at: current?.clock_in_at || new Date().toISOString(),
+      break_started_at: new Date().toISOString(),
+      break_accum_seconds: current?.break_accum_seconds || 0,
+      updated_at: new Date().toISOString()
+    });
     await refreshStatuses();
   }
 
   async function handleAdminEndBreak(employeeId) {
-    if (TEST_MODE) {
-      adminEndBreak(employeeId);
-    } else {
-      const { data: current } = await supabase
-        .from('employee_status').select('*').eq('user_id', employeeId).maybeSingle();
-      const breakStarted = current?.break_started_at ? new Date(current.break_started_at) : null;
-      const additional = breakStarted ? Math.round((Date.now() - breakStarted.getTime()) / 1000) : 0;
-      await supabase.from('employee_status').upsert({
-        user_id: employeeId,
-        status: 'clocked_in',
-        clock_in_at: current?.clock_in_at || new Date().toISOString(),
-        break_started_at: null,
-        break_accum_seconds: (current?.break_accum_seconds || 0) + additional,
-        updated_at: new Date().toISOString()
-      });
-    }
+    const { data: current } = await supabase
+      .from('employee_status').select('*').eq('user_id', employeeId).maybeSingle();
+    const breakStarted = current?.break_started_at ? new Date(current.break_started_at) : null;
+    const additional = breakStarted ? Math.round((Date.now() - breakStarted.getTime()) / 1000) : 0;
+    await supabase.from('employee_status').upsert({
+      user_id: employeeId,
+      status: 'clocked_in',
+      clock_in_at: current?.clock_in_at || new Date().toISOString(),
+      break_started_at: null,
+      break_accum_seconds: (current?.break_accum_seconds || 0) + additional,
+      updated_at: new Date().toISOString()
+    });
     await refreshStatuses();
   }
 
   async function handleAdminClockOut(employeeId) {
-    if (TEST_MODE) {
-      adminClockOut(employeeId);
-      setRecords(getAllRecords());
-    } else {
-      const { data: current } = await supabase
-        .from('employee_status').select('*').eq('user_id', employeeId).maybeSingle();
-      const clockInAt = current?.clock_in_at ? new Date(current.clock_in_at) : new Date();
-      const now = new Date();
-      const totalSeconds = Math.round((now - clockInAt) / 1000) - (current?.break_accum_seconds || 0);
+    const { data: current } = await supabase
+      .from('employee_status').select('*').eq('user_id', employeeId).maybeSingle();
+    const clockInAt = current?.clock_in_at ? new Date(current.clock_in_at) : new Date();
+    const now = new Date();
+    const totalSeconds = Math.round((now - clockInAt) / 1000) - (current?.break_accum_seconds || 0);
 
-      await supabase.from('records').insert([{
-        user_id: employeeId,
-        date: now.toLocaleDateString('en-GB'),
-        clock_in: clockInAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-        clock_out: now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-        hours_worked: secondsToHms(totalSeconds),
-        break_time: secondsToHms(current?.break_accum_seconds || 0),
-        location_status: 'unavailable',
-        adjusted_by_admin: true
-      }]);
+    // Keeps the employee's clock-in location (was hardcoded to 'unavailable',
+    // which showed N/A).
+    await supabase.from('records').insert([{
+      user_id: employeeId,
+      date: now.toLocaleDateString('en-GB'),
+      clock_in: clockInAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      clock_out: now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      hours_worked: secondsToHms(totalSeconds),
+      break_time: secondsToHms(current?.break_accum_seconds || 0),
+      location_status: current?.location_status || 'unavailable',
+      adjusted_by_admin: true
+    }]);
 
-      await supabase.from('employee_status').upsert({
-        user_id: employeeId,
-        status: 'clocked_out',
-        clock_in_at: null,
-        break_started_at: null,
-        break_accum_seconds: 0,
-        updated_at: new Date().toISOString()
-      });
+    await upsertEmployeeStatus({
+      user_id: employeeId,
+      status: 'clocked_out',
+      clock_in_at: null,
+      break_started_at: null,
+      break_accum_seconds: 0,
+      location_status: null,
+      updated_at: new Date().toISOString()
+    });
 
-      await loadData();
-    }
-    await refreshStatuses();
+    await loadData();
   }
 
   // ---------- Timesheet editing ----------
@@ -708,32 +607,69 @@ function AdminDashboard({ user, onLogout }) {
   }
 
   async function saveEdit(recordId) {
-    if (TEST_MODE) {
-      updateRecord(recordId, editForm);
-      setRecords(getAllRecords());
-    } else {
-      await supabase.from('records').update(editForm).eq('id', recordId);
-      await loadData();
-    }
+    await supabase.from('records').update(editForm).eq('id', recordId);
+    await loadData();
     cancelEdit();
   }
 
-  async function handleAuthoriseRecord(recordId) {
-    if (TEST_MODE) {
-      updateRecord(recordId, { location_status: 'authorised' });
-      setRecords(getAllRecords());
-    } else {
-      await supabase.from('records').update({ location_status: 'authorised' }).eq('id', recordId);
-      await loadData();
-    }
+  // ---------- Unauthorised clock-ins: authorise / decline ----------
+
+  // For a finished session (a row in records).
+  async function setRecordLocationStatus(recordId, value) {
+    setLocationSavingId(recordId);
+    const { error } = await supabase.from('records').update({ location_status: value }).eq('id', recordId);
+    if (error) console.log('Failed to update location status:', error);
+    await loadData(true);
+    setLocationSavingId(null);
+  }
+
+  // Still clocked in, so no record yet. Saved on employee_status and copied to
+  // the record at clock-out.
+  async function setLiveLocationStatus(employeeId, value) {
+    setLocationSavingId(`live-${employeeId}`);
+    const { error } = await supabase
+      .from('employee_status')
+      .update({ location_status: value, updated_at: new Date().toISOString() })
+      .eq('user_id', employeeId);
+    if (error) console.log('Failed to update live location status:', error);
+    await refreshStatuses();
+    setLocationSavingId(null);
+  }
+
+  // Current session if clocked in or on break.
+  function getLiveSession(userId) {
+    const s = employeeStatuses[userId];
+    if (!s || !s.clock_in_at) return null;
+    if (s.status !== 'clocked_in' && s.status !== 'on_break') return null;
+    return s;
+  }
+
+  function isLiveUnauthorised(userId) {
+    const live = getLiveSession(userId);
+    return !!live && live.location_status === 'unauthorised';
+  }
+
+  // Unauthorised clock-ins still waiting on authorise/decline, live session
+  // included.
+  function getUnreviewedCount(userId) {
+    const recordCount = records.filter(r => r.user_id === userId && r.location_status === 'unauthorised').length;
+    return recordCount + (isLiveUnauthorised(userId) ? 1 : 0);
+  }
+
+  function getTotalUnreviewed() {
+    return employees.reduce((sum, e) => sum + getUnreviewedCount(e.id), 0);
+  }
+
+  function dayHasUnauthorised(userId, day, dayRecords) {
+    if (dayRecords.some(r => r.location_status === 'unauthorised')) return true;
+    const live = getLiveSession(userId);
+    return !!live && live.location_status === 'unauthorised' && isSameDay(new Date(live.clock_in_at), day);
   }
 
   // ---------- Timesheets: calendar + monthly approval ----------
 
-  // records.date is stored as DD/MM/YYYY (see mockData/records inserts),
-  // not ISO, so this parses that format specifically rather than handing
-  // it to `new Date()`, which reads DD/MM/YYYY inconsistently across
-  // browsers.
+  // records.date is DD/MM/YYYY. Parsed manually since new Date() isn't
+  // consistent across browsers.
   function parseRecordDate(dateStr) {
     if (!dateStr) return null;
     const [d, m, y] = dateStr.split('/').map(Number);
@@ -772,7 +708,7 @@ function AdminDashboard({ user, onLogout }) {
   }
 
   function sumHoursSeconds(recs) {
-    return recs.reduce((sum, r) => sum + hmsToSeconds(r.hours_worked), 0);
+    return recs.filter(isCounted).reduce((sum, r) => sum + hmsToSeconds(r.hours_worked), 0);
   }
 
   function buildCalendarCells(monthDate) {
@@ -800,9 +736,7 @@ function AdminDashboard({ user, onLogout }) {
     return timesheetSelectedDate || new Date();
   }
 
-  // Daily/Weekly/Monthly now actually changes what's on screen (which
-  // day, which week, or the whole month), not just a number in a
-  // sidebar — so navigation shifts by whatever unit is currently active.
+  // Arrows move by a day, week or month depending on the view.
   function shiftPeriod(delta) {
     if (timesheetViewMode === 'monthly') {
       shiftMonth(delta);
@@ -836,11 +770,6 @@ function AdminDashboard({ user, onLogout }) {
     const year = timesheetMonthDate.getFullYear();
     const month = timesheetMonthDate.getMonth() + 1;
 
-    if (TEST_MODE) {
-      setTimesheetApprovalState(getTimesheetApproval(timesheetEmployeeId, year, month));
-      return;
-    }
-
     const { data, error } = await supabase
       .from('timesheet_approvals')
       .select('*')
@@ -858,12 +787,6 @@ function AdminDashboard({ user, onLogout }) {
     const nextApproved = !(timesheetApproval && timesheetApproval.approved);
 
     setApprovalSaving(true);
-
-    if (TEST_MODE) {
-      setTimesheetApprovalState(setTimesheetApproval(timesheetEmployeeId, year, month, nextApproved));
-      setApprovalSaving(false);
-      return;
-    }
 
     const { data, error } = await supabase
       .from('timesheet_approvals')
@@ -919,18 +842,12 @@ function AdminDashboard({ user, onLogout }) {
     const updated = { ...adminSettings, locationAlerts: !adminSettings.locationAlerts };
     setAdminSettingsState(updated);
 
-    if (TEST_MODE) {
-      setAdminSettings(updated);
-    } else {
-      // Shared across every device the admin uses — see app_settings in
-      // supabase/SYNC_AND_AUTOMATION_FIX.sql — rather than one browser's
-      // local storage, which wouldn't follow the admin to another laptop.
-      const { error } = await supabase
-        .from('app_settings')
-        .update({ location_alerts: updated.locationAlerts, updated_at: new Date().toISOString() })
-        .eq('id', 1);
-      if (error) console.log('Failed to save location alerts setting:', error);
-    }
+    // Stored in app_settings so it's the same on every device.
+    const { error } = await supabase
+      .from('app_settings')
+      .update({ location_alerts: updated.locationAlerts, updated_at: new Date().toISOString() })
+      .eq('id', 1);
+    if (error) console.log('Failed to save location alerts setting:', error);
   }
 
   // ---------- Time off approvals ----------
@@ -951,10 +868,7 @@ function AdminDashboard({ user, onLogout }) {
     setSelectedTimeOffIds(allSelected ? [] : pendingIds);
   }
 
-  // Falls back to a plain, still-useful message if the AI drafting step
-  // is unavailable (its own edge function + API key, separate from
-  // everything else we've set up) — the employee should get *a* message
-  // either way, not silence.
+  // Fallback message if drafting fails.
   function plainDecisionMessage(request, status) {
     const range = request.start_date === request.end_date
       ? formatDisplayDate(request.start_date)
@@ -964,16 +878,13 @@ function AdminDashboard({ user, onLogout }) {
       : `Your ${request.type} request for ${range} was not approved. Reach out to your admin if you have questions.`;
   }
 
-  // Drafts a short decision message with AI, saves it on the request so
-  // the employee sees it in their Time Off history, and emails it to them.
-  // The AI draft is a nice-to-have — if it fails, we still save and email
-  // a plain fallback message. The notification itself should never depend
-  // on the AI step succeeding.
+  // Draft the decision message, save it on the request and email it. Plain
+  // message if drafting fails.
   async function draftAndSendDecision(request, status) {
     let message = null;
     try {
       const result = await callAI('time_off_message', {
-        employeeName: getEmployeeName(request.user_id),
+        employeeName: request.employee_name || getEmployeeName(request.user_id),
         type: request.type,
         startDate: request.start_date,
         endDate: request.end_date,
@@ -987,16 +898,11 @@ function AdminDashboard({ user, onLogout }) {
 
     const finalMessage = message || plainDecisionMessage(request, status);
 
-    if (TEST_MODE) {
-      updateTimeOffStatus(request.id, status, finalMessage);
-      setAllTimeOff(getAllTimeOffRequests());
-    } else {
-      await supabase
-        .from('time_off_requests')
-        .update({ status, admin_message: finalMessage })
-        .eq('id', request.id);
-      await loadData();
-    }
+    await supabase
+      .from('time_off_requests')
+      .update({ status, admin_message: finalMessage })
+      .eq('id', request.id);
+    await loadData();
   }
 
   async function handleTimeOffAction(id, status) {
@@ -1017,8 +923,7 @@ function AdminDashboard({ user, onLogout }) {
     for (const id of idsToProcess) {
       const request = allTimeOff.find(t => t.id === id);
       if (request) {
-        // Sequential, not parallel — keeps this simple and stays well
-        // within the AI API's rate limits for a handful of requests.
+        // Sequential to stay under the API rate limits.
         // eslint-disable-next-line no-await-in-loop
         await draftAndSendDecision(request, status);
       }
@@ -1049,6 +954,12 @@ function AdminDashboard({ user, onLogout }) {
       setAnomalyNotes(prev => ({ ...prev, [employeeId]: "Couldn't reach the assistant just now — please try again." }));
     }
     setAnomalyLoadingId(null);
+  }
+
+  // Close the mobile menu after picking a tab.
+  function goToTab(tab) {
+    setActiveTab(tab);
+    setIsNavOpen(false);
   }
 
   return (
@@ -1084,6 +995,19 @@ function AdminDashboard({ user, onLogout }) {
                 )}
               </span>
             </div>
+            {getLiveSession(selectedEmployee.id) && (
+              <div className="admin-full-field">
+                <span className="timesheet-field-label">Clock-in location</span>
+                <div className="location-cell">
+                  <span className={`location-tag location-tag-${getLiveSession(selectedEmployee.id).location_status || 'unavailable'}`}>
+                    {locationLabel(getLiveSession(selectedEmployee.id).location_status)}
+                  </span>
+                  {isLiveUnauthorised(selectedEmployee.id) && (
+                    <span className="admin-link-muted">Review it on the Timesheets tab</span>
+                  )}
+                </div>
+              </div>
+            )}
             <div className="admin-modal-actions">
               {['not_clocked_in', 'clocked_out', 'on_leave'].includes(getStatus(selectedEmployee.id)) && (
                 <button className="admin-action-btn admin-action-in" onClick={() => handleAdminClockIn(selectedEmployee.id)}>
@@ -1136,7 +1060,7 @@ function AdminDashboard({ user, onLogout }) {
         </div>
       )}
 
-      {/* Full details — edit name/department, delete account */}
+      {/* Full details: edit name/department, delete account */}
       {fullDetailsEmployee && (
         <div className="admin-modal-overlay" onClick={() => setFullDetailsEmployee(null)}>
           <div className="admin-full-details-box" onClick={e => e.stopPropagation()}>
@@ -1232,28 +1156,25 @@ function AdminDashboard({ user, onLogout }) {
         </div>
       )}
 
-      {/* Delete confirmation — requires the admin's password */}
+      {/* Delete confirmation (admin password required) */}
       {deleteConfirmEmployee && (
         <div className="admin-modal-overlay" onClick={() => setDeleteConfirmEmployee(null)}>
           <div className="admin-confirm-box" onClick={e => e.stopPropagation()}>
             <h3>Delete {deleteConfirmEmployee.full_name || deleteConfirmEmployee.email}?</h3>
             <p className="admin-confirm-note">
               This removes their login and profile immediately. Their past clock-in and time off
-              records are kept.
-              {!TEST_MODE && ' Enter your admin password to confirm.'}
+              records are kept. Enter your admin password to confirm.
             </p>
 
-            {!TEST_MODE && (
-              <input
-                type="password"
-                className="admin-dept-input admin-confirm-input"
-                placeholder="Your admin password"
-                value={deleteConfirmPassword}
-                onChange={e => setDeleteConfirmPassword(e.target.value)}
-                autoFocus
-                onKeyDown={e => e.key === 'Enter' && submitDeleteConfirm()}
-              />
-            )}
+            <input
+              type="password"
+              className="admin-dept-input admin-confirm-input"
+              placeholder="Your admin password"
+              value={deleteConfirmPassword}
+              onChange={e => setDeleteConfirmPassword(e.target.value)}
+              autoFocus
+              onKeyDown={e => e.key === 'Enter' && submitDeleteConfirm()}
+            />
 
             {deleteConfirmError && <p className="admin-confirm-error">{deleteConfirmError}</p>}
 
@@ -1274,72 +1195,84 @@ function AdminDashboard({ user, onLogout }) {
         </div>
       )}
 
-      {/* Sidebar */}
-      <div className="admin-sidebar">
-        <div className="admin-brand">
-          <HourglassIcon width={20} height={20} />
-          <span className="brand-name">Mmerℇ</span>
-        </div>
-
-        <div className="admin-label">Admin panel</div>
-
-        <nav className="admin-nav">
-          <button
-            className={`admin-nav-item ${activeTab === 'employees' ? 'active' : ''}`}
-            onClick={() => setActiveTab('employees')}>
-            <UsersIcon width={17} height={17} /> Employees
-          </button>
-          <button
-            className={`admin-nav-item ${activeTab === 'approvals' ? 'active' : ''}`}
-            onClick={() => setActiveTab('approvals')}>
-            <UserIcon width={17} height={17} /> Approvals
-            {pendingUsers.length > 0 && (
-              <span className="admin-nav-badge">{pendingUsers.length}</span>
-            )}
-          </button>
-          <button
-            className={`admin-nav-item ${activeTab === 'timesheets' ? 'active' : ''}`}
-            onClick={() => setActiveTab('timesheets')}>
-            <TimesheetIcon width={17} height={17} /> Timesheets
-          </button>
-          <button
-            className={`admin-nav-item ${activeTab === 'timeoff' ? 'active' : ''}`}
-            onClick={() => setActiveTab('timeoff')}>
-            <SuitcaseIcon width={17} height={17} /> Time Off
-            {pendingTimeOffIds().length > 0 && (
-              <span className="admin-nav-badge">{pendingTimeOffIds().length}</span>
-            )}
-          </button>
-          <button
-            className={`admin-nav-item ${activeTab === 'faq' ? 'active' : ''}`}
-            onClick={() => setActiveTab('faq')}>
-            <HelpIcon width={17} height={17} /> FAQ
-          </button>
-          <button
-            className={`admin-nav-item ${activeTab === 'settings' ? 'active' : ''}`}
-            onClick={() => setActiveTab('settings')}>
-            <SettingsIcon width={17} height={17} /> Settings
-          </button>
-        </nav>
-
-        <div className="admin-user">
-          <div className="admin-avatar">A</div>
-          <div className="admin-info">
-            <p className="admin-name">Administrator</p>
-            <p className="admin-role">Admin</p>
+      {/* Sidebar (top bar + menu button on smaller screens) */}
+      {isNavOpen && <div className="sidebar-backdrop" onClick={() => setIsNavOpen(false)} />}
+      <div className={`admin-sidebar ${isNavOpen ? 'nav-open' : ''}`}>
+        <div className="sidebar-top">
+          <div>
+            <div className="admin-brand">
+              <HourglassIcon width={20} height={20} />
+              <span className="brand-name">Mmerℇ</span>
+            </div>
+            <div className="admin-label">Admin panel</div>
           </div>
+          <button
+            className="sidebar-menu-toggle"
+            onClick={() => setIsNavOpen(prev => !prev)}
+            aria-label={isNavOpen ? 'Close menu' : 'Open menu'}
+            aria-expanded={isNavOpen}>
+            {isNavOpen ? <XIcon width={18} height={18} /> : <MenuIcon width={18} height={18} />}
+          </button>
         </div>
 
-        <button
-          className="dark-mode-toggle admin-dark-toggle"
-          onClick={() => setIsDarkMode(prev => !prev)}>
-          {isDarkMode ? <SunIcon width={16} height={16} /> : <MoonIcon width={16} height={16} />}
-          {isDarkMode ? 'Light' : 'Dark'}
-        </button>
+        <div className="sidebar-collapsible">
+          <nav className="admin-nav">
+            <button
+              className={`admin-nav-item ${activeTab === 'employees' ? 'active' : ''}`}
+              onClick={() => goToTab('employees')}>
+              <UsersIcon width={17} height={17} /> Employees
+            </button>
+            <button
+              className={`admin-nav-item ${activeTab === 'approvals' ? 'active' : ''}`}
+              onClick={() => goToTab('approvals')}>
+              <UserIcon width={17} height={17} /> Approvals
+              {pendingUsers.length > 0 && (
+                <span className="admin-nav-badge">{pendingUsers.length}</span>
+              )}
+            </button>
+            <button
+              className={`admin-nav-item ${activeTab === 'timesheets' ? 'active' : ''}`}
+              onClick={() => goToTab('timesheets')}
+              title={adminSettings.locationAlerts && getTotalUnreviewed() > 0 ? 'Clock-ins from an unauthorised location waiting for review' : undefined}>
+              <TimesheetIcon width={17} height={17} /> Timesheets
+              {adminSettings.locationAlerts && getTotalUnreviewed() > 0 && (
+                <span className="admin-nav-badge">{getTotalUnreviewed()}</span>
+              )}
+            </button>
+            <button
+              className={`admin-nav-item ${activeTab === 'timeoff' ? 'active' : ''}`}
+              onClick={() => goToTab('timeoff')}>
+              <SuitcaseIcon width={17} height={17} /> Time Off
+              {pendingTimeOffIds().length > 0 && (
+                <span className="admin-nav-badge">{pendingTimeOffIds().length}</span>
+              )}
+            </button>
+            <button
+              className={`admin-nav-item ${activeTab === 'settings' ? 'active' : ''}`}
+              onClick={() => goToTab('settings')}>
+              <SettingsIcon width={17} height={17} /> Settings
+            </button>
+          </nav>
 
-        <button className="admin-signout" onClick={onLogout}>
-          <LogoutIcon width={15} height={15} /> Sign Out
-        </button>
+          <div className="admin-user">
+            <div className="admin-avatar">A</div>
+            <div className="admin-info">
+              <p className="admin-name">Administrator</p>
+              <p className="admin-role">Admin</p>
+            </div>
+          </div>
+
+          <button
+            className="dark-mode-toggle admin-dark-toggle"
+            onClick={() => setIsDarkMode(prev => !prev)}>
+            {isDarkMode ? <SunIcon width={16} height={16} /> : <MoonIcon width={16} height={16} />}
+            {isDarkMode ? 'Light' : 'Dark'}
+          </button>
+
+          <button className="admin-signout" onClick={onLogout}>
+            <LogoutIcon width={15} height={15} /> Sign Out
+          </button>
+        </div>
       </div>
 
       {/* Main Content */}
@@ -1559,6 +1492,9 @@ function AdminDashboard({ user, onLogout }) {
                             <span className={`status-badge status-${statusTone(status)}`}>
                               {statusLabel(status)}
                             </span>
+                            {isLiveUnauthorised(employee.id) && (
+                              <span className="timesheet-record-flag" title="Clocked in from an unauthorised location" />
+                            )}
                           </td>
                           <td className="cell-success">
                             {getTotalHoursToday(employee.id)}
@@ -1580,7 +1516,7 @@ function AdminDashboard({ user, onLogout }) {
             <div className="admin-header">
               <div>
                 <h1>Timesheets</h1>
-                <p className="admin-date">Pick an employee, browse their calendar, and approve completed months</p>
+                <p className="admin-date">Pick an employee, browse their calendar, review unauthorised clock-ins and approve completed months</p>
               </div>
               <button className="refresh-btn" onClick={loadData}>
                 <RefreshIcon width={15} height={15} /> Refresh
@@ -1600,9 +1536,14 @@ function AdminDashboard({ user, onLogout }) {
                     className="admin-select"
                     value={timesheetEmployeeId}
                     onChange={e => { setTimesheetEmployeeId(e.target.value); setTimesheetSelectedDate(null); }}>
-                    {employees.map(emp => (
-                      <option key={emp.id} value={emp.id}>{emp.full_name || emp.email}</option>
-                    ))}
+                    {employees.map(emp => {
+                      const toReview = getUnreviewedCount(emp.id);
+                      return (
+                        <option key={emp.id} value={emp.id}>
+                          {emp.full_name || emp.email}{toReview > 0 ? ` (${toReview} to review)` : ''}
+                        </option>
+                      );
+                    })}
                   </select>
 
                   <div className="timesheet-view-toggle">
@@ -1662,7 +1603,7 @@ function AdminDashboard({ user, onLogout }) {
                       {buildCalendarCells(timesheetMonthDate).map((day, i) => {
                         if (!day) return <div key={`blank-${i}`} className="timesheet-day-cell empty" />;
                         const dayRecords = getRecordsForDay(timesheetEmployeeId, day);
-                        const hasUnauthorised = dayRecords.some(r => r.location_status === 'unauthorised');
+                        const hasUnauthorised = dayHasUnauthorised(timesheetEmployeeId, day, dayRecords);
                         const totalSecs = sumHoursSeconds(dayRecords);
                         const isSelected = isSameDay(day, timesheetSelectedDate);
                         const isToday = isSameDay(day, new Date());
@@ -1695,7 +1636,7 @@ function AdminDashboard({ user, onLogout }) {
                     <div className="timesheet-week-card">
                       {weekDays.map(day => {
                         const dayRecords = getRecordsForDay(timesheetEmployeeId, day);
-                        const hasUnauthorised = dayRecords.some(r => r.location_status === 'unauthorised');
+                        const hasUnauthorised = dayHasUnauthorised(timesheetEmployeeId, day, dayRecords);
                         const totalSecs = sumHoursSeconds(dayRecords);
                         const isSelected = isSameDay(day, timesheetSelectedDate);
                         const isToday = isSameDay(day, new Date());
@@ -1718,75 +1659,160 @@ function AdminDashboard({ user, onLogout }) {
                   );
                 })()}
 
-                {(timesheetViewMode !== 'monthly' || timesheetSelectedDate) && (
-                  <div className="timesheet-day-detail">
-                    <h3>
-                      {getActiveDate().toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })}
-                    </h3>
-                    {getRecordsForDay(timesheetEmployeeId, getActiveDate()).length === 0 ? (
-                      <p className="timesheet-day-empty">No session recorded this day.</p>
-                    ) : (
-                      getRecordsForDay(timesheetEmployeeId, getActiveDate()).map(record => {
-                        const isEditing = editingRecordId === record.id;
-                        const monthLocked = !!(timesheetApproval && timesheetApproval.approved);
-                        return (
-                          <div className="timesheet-day-record" key={record.id}>
-                            <div className="timesheet-day-record-grid">
-                              <div>
-                                <span className="timesheet-field-label">Clock In</span>
-                                {isEditing ? (
-                                  <input className="admin-edit-input" value={editForm.clock_in} onChange={e => setEditForm({ ...editForm, clock_in: e.target.value })} />
-                                ) : <p>{record.clock_in}</p>}
-                              </div>
-                              <div>
-                                <span className="timesheet-field-label">Clock Out</span>
-                                {isEditing ? (
-                                  <input className="admin-edit-input" value={editForm.clock_out} onChange={e => setEditForm({ ...editForm, clock_out: e.target.value })} />
-                                ) : <p>{record.clock_out}</p>}
-                              </div>
-                              <div>
-                                <span className="timesheet-field-label">Break Time</span>
-                                {isEditing ? (
-                                  <input className="admin-edit-input" value={editForm.break_time} onChange={e => setEditForm({ ...editForm, break_time: e.target.value })} />
-                                ) : <p className="cell-warning">{record.break_time}</p>}
-                              </div>
-                              <div>
-                                <span className="timesheet-field-label">Hours Worked</span>
-                                {isEditing ? (
-                                  <input className="admin-edit-input" value={editForm.hours_worked} onChange={e => setEditForm({ ...editForm, hours_worked: e.target.value })} />
-                                ) : <p className="cell-success">{record.hours_worked}</p>}
-                              </div>
-                              <div>
-                                <span className="timesheet-field-label">Location</span>
-                                <div className="location-cell">
-                                  <span className={`location-tag location-tag-${record.location_status || 'unavailable'}`}>
-                                    {record.location_status === 'authorised' ? 'Authorised' :
-                                     record.location_status === 'unauthorised' ? 'Unauthorised' : 'N/A'}
-                                  </span>
-                                  {record.location_status === 'unauthorised' && (
-                                    <button className="admin-link-btn" onClick={() => handleAuthoriseRecord(record.id)}>Authorise</button>
-                                  )}
-                                </div>
-                              </div>
+                {(timesheetViewMode !== 'monthly' || timesheetSelectedDate) && (() => {
+                  const activeDay = getActiveDate();
+                  const dayRecords = getRecordsForDay(timesheetEmployeeId, activeDay);
+                  const live = getLiveSession(timesheetEmployeeId);
+                  const showLive = !!live && isSameDay(new Date(live.clock_in_at), activeDay);
+                  const monthLocked = !!(timesheetApproval && timesheetApproval.approved);
+
+                  return (
+                    <div className="timesheet-day-detail">
+                      <h3>
+                        {activeDay.toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })}
+                      </h3>
+
+                      {/* Live session (still clocked in, not in records yet) */}
+                      {showLive && (
+                        <div className="timesheet-day-record">
+                          <div className="timesheet-day-record-grid">
+                            <div>
+                              <span className="timesheet-field-label">Clock In</span>
+                              <p>
+                                {new Date(live.clock_in_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                                {live.location_status === 'unauthorised' && (
+                                  <span className="timesheet-record-flag" title="Unauthorised location" />
+                                )}
+                              </p>
                             </div>
-                            <div className="timesheet-day-record-actions">
-                              {isEditing ? (
-                                <>
-                                  <button className="admin-link-btn" onClick={() => saveEdit(record.id)}>Save</button>
-                                  <button className="admin-link-btn admin-link-muted" onClick={cancelEdit}>Cancel</button>
-                                </>
-                              ) : monthLocked ? (
-                                <span className="admin-link-muted">Month approved — reopen to edit</span>
-                              ) : (
-                                <button className="admin-link-btn" onClick={() => startEdit(record)}>Edit</button>
-                              )}
+                            <div>
+                              <span className="timesheet-field-label">Clock Out</span>
+                              <p>{live.status === 'on_break' ? 'On break' : 'In progress'}</p>
+                            </div>
+                            <div>
+                              <span className="timesheet-field-label">Break Time</span>
+                              <p className="cell-warning">{secondsToHms(live.break_accum_seconds || 0)}</p>
+                            </div>
+                            <div>
+                              <span className="timesheet-field-label">Hours Worked</span>
+                              <p className="cell-success">In progress</p>
+                            </div>
+                            <div>
+                              <span className="timesheet-field-label">Location</span>
+                              <div className="location-cell">
+                                <span className={`location-tag location-tag-${live.location_status || 'unavailable'}`}>
+                                  {locationLabel(live.location_status)}
+                                </span>
+                              </div>
                             </div>
                           </div>
-                        );
-                      })
-                    )}
-                  </div>
-                )}
+                          {(live.location_status === 'unauthorised' || live.location_status === 'declined') && (
+                            <div className="timesheet-day-record-actions">
+                              <button
+                                className="admin-link-btn"
+                                disabled={locationSavingId === `live-${timesheetEmployeeId}`}
+                                onClick={() => setLiveLocationStatus(timesheetEmployeeId, 'authorised')}>
+                                Authorise
+                              </button>
+                              {live.location_status === 'unauthorised' && (
+                                <button
+                                  className="admin-link-btn admin-link-danger"
+                                  disabled={locationSavingId === `live-${timesheetEmployeeId}`}
+                                  onClick={() => setLiveLocationStatus(timesheetEmployeeId, 'declined')}>
+                                  Decline
+                                </button>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      )}
+
+                      {dayRecords.length === 0 && !showLive ? (
+                        <p className="timesheet-day-empty">No session recorded this day.</p>
+                      ) : (
+                        dayRecords.map(record => {
+                          const isEditing = editingRecordId === record.id;
+                          const needsReview = record.location_status === 'unauthorised';
+                          const isDeclined = record.location_status === 'declined';
+                          const savingLocation = locationSavingId === record.id;
+                          return (
+                            <div className="timesheet-day-record" key={record.id}>
+                              <div className="timesheet-day-record-grid">
+                                <div>
+                                  <span className="timesheet-field-label">Clock In</span>
+                                  {isEditing ? (
+                                    <input className="admin-edit-input" value={editForm.clock_in} onChange={e => setEditForm({ ...editForm, clock_in: e.target.value })} />
+                                  ) : (
+                                    <p>
+                                      {record.clock_in}
+                                      {needsReview && <span className="timesheet-record-flag" title="Unauthorised location" />}
+                                    </p>
+                                  )}
+                                </div>
+                                <div>
+                                  <span className="timesheet-field-label">Clock Out</span>
+                                  {isEditing ? (
+                                    <input className="admin-edit-input" value={editForm.clock_out} onChange={e => setEditForm({ ...editForm, clock_out: e.target.value })} />
+                                  ) : <p>{record.clock_out}</p>}
+                                </div>
+                                <div>
+                                  <span className="timesheet-field-label">Break Time</span>
+                                  {isEditing ? (
+                                    <input className="admin-edit-input" value={editForm.break_time} onChange={e => setEditForm({ ...editForm, break_time: e.target.value })} />
+                                  ) : <p className="cell-warning">{record.break_time}</p>}
+                                </div>
+                                <div>
+                                  <span className="timesheet-field-label">Hours Worked</span>
+                                  {isEditing ? (
+                                    <input className="admin-edit-input" value={editForm.hours_worked} onChange={e => setEditForm({ ...editForm, hours_worked: e.target.value })} />
+                                  ) : <p className={isDeclined ? 'cell-declined' : 'cell-success'}>{record.hours_worked}</p>}
+                                </div>
+                                <div>
+                                  <span className="timesheet-field-label">Location</span>
+                                  <div className="location-cell">
+                                    <span className={`location-tag location-tag-${record.location_status || 'unavailable'}`}>
+                                      {locationLabel(record.location_status)}
+                                    </span>
+                                  </div>
+                                </div>
+                              </div>
+                              <div className="timesheet-day-record-actions">
+                                {isEditing ? (
+                                  <>
+                                    <button className="admin-link-btn" onClick={() => saveEdit(record.id)}>Save</button>
+                                    <button className="admin-link-btn admin-link-muted" onClick={cancelEdit}>Cancel</button>
+                                  </>
+                                ) : monthLocked ? (
+                                  <span className="admin-link-muted">Month approved — reopen to edit</span>
+                                ) : (
+                                  <>
+                                    {(needsReview || isDeclined) && (
+                                      <button
+                                        className="admin-link-btn"
+                                        disabled={savingLocation}
+                                        onClick={() => setRecordLocationStatus(record.id, 'authorised')}>
+                                        Authorise
+                                      </button>
+                                    )}
+                                    {needsReview && (
+                                      <button
+                                        className="admin-link-btn admin-link-danger"
+                                        disabled={savingLocation}
+                                        onClick={() => setRecordLocationStatus(record.id, 'declined')}>
+                                        Decline
+                                      </button>
+                                    )}
+                                    <button className="admin-link-btn" onClick={() => startEdit(record)}>Edit</button>
+                                  </>
+                                )}
+                              </div>
+                            </div>
+                          );
+                        })
+                      )}
+                    </div>
+                  );
+                })()}
               </>
             )}
           </>
@@ -1850,7 +1876,7 @@ function AdminDashboard({ user, onLogout }) {
                       </div>
                       <div className="timeoff-admin-main">
                         <p className="timeoff-history-type">
-                          {getEmployeeName(req.user_id)} · {req.type}
+                          {getEmployeeName(req.user_id, req.employee_name)} · {req.type}
                         </p>
                         <p className="timeoff-history-dates">
                           {formatDisplayDate(req.start_date)}
@@ -1887,34 +1913,6 @@ function AdminDashboard({ user, onLogout }) {
           </>
         )}
 
-        {/* ===== FAQ TAB ===== */}
-        {activeTab === 'faq' && (
-          <>
-            <div className="admin-header">
-              <div>
-                <h1>FAQ</h1>
-                <p className="admin-date">Quick answers for common questions</p>
-              </div>
-            </div>
-
-            <div className="faq-list">
-              {FAQ_ITEMS.map((item, i) => (
-                <div className="faq-item" key={i}>
-                  <button
-                    className="faq-question"
-                    onClick={() => setOpenFaqIndex(openFaqIndex === i ? null : i)}>
-                    {item.q}
-                    <span className="faq-toggle">{openFaqIndex === i ? '−' : '+'}</span>
-                  </button>
-                  {openFaqIndex === i && (
-                    <p className="faq-answer">{item.a}</p>
-                  )}
-                </div>
-              ))}
-            </div>
-          </>
-        )}
-
         {/* ===== SETTINGS TAB ===== */}
         {activeTab === 'settings' && (
           <>
@@ -1930,7 +1928,7 @@ function AdminDashboard({ user, onLogout }) {
                 <div className="reminder-icon"><PinIcon width={18} height={18} /></div>
                 <div className="reminder-info">
                   <h3>Location Alerts</h3>
-                  <p>Get notified whenever a clock-in happens from an unauthorised location, so it can be reviewed and authorised from the Timesheets tab.</p>
+                  <p>Show a count on the Timesheets tab whenever someone clocks in from an unauthorised location, so you can authorise or decline it from their timesheet.</p>
                 </div>
                 <label className="toggle-switch">
                   <input

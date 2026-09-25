@@ -213,8 +213,7 @@
 }
 
 /* ---------- Dark mode ---------- */
-/* Card surfaces get a step up from the page background instead of
-   staying stark white, so the contrast reads as intentional, not harsh. */
+/* Cards a shade lighter than the page instead of white */
 .profile-page.dark {
   background: var(--navy);
   min-height: 100%;

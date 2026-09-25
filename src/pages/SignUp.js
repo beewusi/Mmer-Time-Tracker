@@ -47,10 +47,9 @@ function SignUp({ onGoToLogin }) {
       setError(error.message);
       setLoading(false);
     } else {
-      // Profile row (status: 'pending', no department yet) is created
-      // automatically by a database trigger on the new auth user — see
-      // supabase/APPROVAL_MIGRATION.sql. That trigger also covers Google
-      // sign-ups, which never go through this code path at all.
+      // Profile row (status 'pending', no department) is created by the
+      // trigger in supabase/APPROVAL_MIGRATION.sql. Google sign-ups go through
+      // the same trigger.
       setSuccess("Account created! An admin needs to approve you and set your department before you can sign in.");
       setFullName('');
       setEmail('');

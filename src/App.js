@@ -14,9 +14,8 @@ function App() {
   const [pendingStatus, setPendingStatus] = useState('pending');
   const [loading, setLoading] = useState(true);
 
-  // Admin is still identified by ADMIN_EMAIL, same as before — the admin
-  // account never needs to wait on its own approval. Everyone else's
-  // access is gated by their profiles.status until an admin approves them.
+  // Admin is identified by ADMIN_EMAIL and skips approval. Everyone else needs
+  // profiles.status = 'approved'.
   async function resolvePageForUser(sessionUser) {
     if (sessionUser.email === ADMIN_EMAIL) {
       return 'admin';
@@ -28,10 +27,8 @@ function App() {
       .eq('id', sessionUser.id)
       .maybeSingle();
 
-    // No row yet (e.g. a brand-new Google sign-in a beat ahead of the
-    // profile-creation trigger) is treated the same as "pending" — never
-    // let someone straight into the dashboard when we can't confirm
-    // they've been approved.
+    // No profile row yet (new Google sign-in before the trigger runs) counts
+    // as pending.
     if (error || !profile || profile.status !== 'approved') {
       setPendingStatus(profile?.status || 'pending');
       return 'pending-approval';
@@ -51,8 +48,7 @@ function App() {
 
     const { data: { subscription } } = supabase.auth.onAuthStateChange(
       async (event, session) => {
-        // A real password-reset link lands here first — send the person
-        // to the "set new password" screen instead of straight into the app.
+        // Password reset link goes to the set new password screen.
         if (event === 'PASSWORD_RECOVERY') {
           setPage('reset-password');
           return;

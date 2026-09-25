@@ -4,8 +4,8 @@ import AuthPanel from '../components/AuthPanel';
 import PasswordInput from '../components/PasswordInput';
 import './ResetPassword.css';
 
-// Reached via the link in a real password-reset email — Supabase fires
-// a PASSWORD_RECOVERY auth event that App.js listens for.
+// Opened from the password-reset email link (PASSWORD_RECOVERY event in
+// App.js).
 function ResetPassword({ onGoToLogin }) {
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');

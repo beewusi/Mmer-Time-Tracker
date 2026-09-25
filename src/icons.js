@@ -1,5 +1,4 @@
-// Small inline icon set, used in place of emoji throughout the app.
-// Kept as plain SVGs so there's no extra dependency to install.
+// Inline SVG icons used instead of emoji. No extra dependency.
 
 const base = {
   width: 18,
@@ -148,8 +147,7 @@ export const EyeOffIcon = (props) => (
   </svg>
 );
 
-// Google's brand mark keeps its own fixed four-colour palette rather than
-// following the app's currentColor icon style.
+// Google logo keeps its own colours instead of currentColor.
 export const GoogleIcon = (props) => (
   <svg viewBox="0 0 48 48" width={18} height={18} {...props}>
     <path fill="#FFC107" d="M43.6 20.5H42V20H24v8h11.3c-1.6 4.7-6.1 8-11.3 8-6.6 0-12-5.4-12-12s5.4-12 12-12c3.1 0 5.8 1.1 8 3l5.7-5.7C34.6 6 29.6 4 24 4 12.9 4 4 12.9 4 24s8.9 20 20 20 20-8.9 20-20c0-1.2-.1-2.4-.4-3.5Z" />
@@ -204,5 +202,11 @@ export const SettingsIcon = (props) => (
 export const ChatIcon = (props) => (
   <svg {...base} {...props}>
     <path d="M4 5h16a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H9l-4 4v-4H4a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1Z" />
+  </svg>
+);
+
+export const MenuIcon = (props) => (
+  <svg {...base} {...props}>
+    <path d="M4 6h16M4 12h16M4 18h16" />
   </svg>
 );

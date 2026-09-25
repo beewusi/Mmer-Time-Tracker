@@ -309,7 +309,7 @@
   border: var(--border);
   border-radius: var(--radius-md);
   box-shadow: var(--shadow-card);
-  overflow: hidden;
+  overflow-x: auto;
 }
 
 .admin-table {
@@ -775,9 +775,7 @@
 }
 
 /* ---------- Dark mode ---------- */
-/* The sidebar is always the same navy regardless of theme (it's the
-   brand color, not a "light" surface), so it needs no dark overrides —
-   only .admin-main and everything inside it does. */
+/* Sidebar stays navy in both themes, only .admin-main needs dark overrides */
 
 .admin-layout.dark .admin-main {
   background: var(--navy);
@@ -786,7 +784,6 @@
 .admin-layout.dark .admin-header h1,
 .admin-layout.dark .admin-modal-header h3,
 .admin-layout.dark .admin-confirm-box h3,
-.admin-layout.dark .faq-question,
 .admin-layout.dark .admin-name {
   color: var(--white);
 }
@@ -801,7 +798,6 @@
 .admin-layout.dark .timeoff-history-dates,
 .admin-layout.dark .timeoff-history-reason,
 .admin-layout.dark .timeoff-history-response-text,
-.admin-layout.dark .faq-answer,
 .admin-layout.dark .not-set,
 .admin-layout.dark .admin-link-muted {
   color: var(--gray-300);
@@ -817,7 +813,6 @@
 .admin-layout.dark .admin-table-card,
 .admin-layout.dark .admin-modal-box,
 .admin-layout.dark .admin-confirm-box,
-.admin-layout.dark .faq-item,
 .admin-layout.dark .timeoff-admin-card {
   background: var(--navy-700);
   border-color: rgba(248, 250, 252, 0.1);
@@ -1327,7 +1322,25 @@
 
 .timesheet-day-record-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 10px;
+}
+
+/* Inline red dot for unauthorised clock-ins (records + Employees table) */
+.timesheet-record-flag {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-left: 7px;
+  border-radius: 50%;
+  background: var(--danger, #d64545);
+  vertical-align: middle;
+}
+
+.cell-declined {
+  color: var(--gray-400);
+  font-weight: 600;
+  text-decoration: line-through;
 }
 
 
@@ -1456,73 +1469,147 @@
   font-style: italic;
 }
 
-/* ---------- FAQ ---------- */
-.faq-list {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.faq-item {
-  background: #FFFFFF;
-  border: var(--border);
-  border-radius: var(--radius-md);
-  overflow: hidden;
-}
-
-.faq-question {
-  width: 100%;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--space-3);
-  background: none;
-  border: none;
-  text-align: left;
-  padding: var(--space-3) var(--space-4);
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--navy-700);
-  cursor: pointer;
-}
-
-.faq-toggle {
-  font-size: 18px;
-  color: var(--gray-400);
-  flex-shrink: 0;
-}
-
-.faq-answer {
-  padding: 0 var(--space-4) var(--space-3);
-  font-size: 13.5px;
-  color: var(--gray-600);
-  line-height: 1.6;
-  margin: 0;
-}
-
 /* ---------- Responsive ---------- */
+@media (max-width: 1180px) {
+  .admin-main {
+    padding: var(--space-5) var(--space-4);
+  }
+}
+
 @media (max-width: 1024px) {
   .admin-stats {
     grid-template-columns: repeat(2, 1fr);
   }
 }
 
-@media (max-width: 780px) {
+/* Below 900px: sidebar becomes a top bar, nav drops down from the menu button */
+@media (max-width: 900px) {
   .admin-layout {
     flex-direction: column;
   }
   .admin-sidebar {
+    position: sticky;
+    top: 0;
+    z-index: 900;
     width: 100%;
     height: auto;
-    position: static;
+    padding: 12px var(--space-3);
   }
+  .admin-sidebar .sidebar-top {
+    align-items: center;
+  }
+  .admin-label {
+    margin-bottom: 0;
+  }
+  .admin-sidebar .sidebar-menu-toggle {
+    display: inline-flex;
+  }
+  .admin-sidebar .sidebar-collapsible {
+    display: none;
+    position: absolute;
+    top: 100%;
+    left: 0;
+    right: 0;
+    max-height: calc(100vh - 70px);
+    overflow-y: auto;
+    background: inherit;
+    padding: var(--space-2) var(--space-3) var(--space-3);
+    border-top: 1px solid rgba(248, 250, 252, 0.08);
+    box-shadow: 0 12px 24px rgba(15, 23, 42, 0.25);
+  }
+  .admin-sidebar.nav-open .sidebar-collapsible {
+    display: flex;
+    gap: var(--space-2);
+  }
+  .admin-layout .sidebar-backdrop {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: 850;
+    background: rgba(15, 23, 42, 0.35);
+  }
+  .admin-table {
+    min-width: 680px;
+  }
+  .admin-table th,
+  .admin-table td {
+    white-space: nowrap;
+  }
+}
+
+@media (max-width: 780px) {
   .admin-main {
-    padding: var(--space-4);
+    padding: var(--space-4) var(--space-3);
   }
   .admin-stats {
     grid-template-columns: 1fr 1fr;
   }
   .timeoff-admin-row {
     flex-wrap: wrap;
+  }
+  .timesheet-controls {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .timesheet-view-toggle {
+    overflow-x: auto;
+  }
+  .timesheet-view-btn {
+    flex: 1;
+    white-space: nowrap;
+  }
+  .timesheet-month-nav {
+    justify-content: space-between;
+  }
+  .timesheet-month-label {
+    min-width: 0;
+    flex: 1;
+  }
+  .timeoff-bulk-actions {
+    flex-wrap: wrap;
+  }
+}
+
+@media (max-width: 480px) {
+  .admin-main {
+    padding: var(--space-3) 12px;
+  }
+  .admin-header h1 {
+    font-size: 20px;
+  }
+  .admin-stats {
+    gap: var(--space-2);
+  }
+  .timesheet-calendar-card,
+  .timesheet-week-card,
+  .timesheet-day-detail,
+  .timesheet-approval-bar {
+    padding: 12px;
+  }
+  .timesheet-calendar-grid,
+  .timesheet-calendar-weekdays,
+  .timesheet-week-card {
+    gap: 3px;
+  }
+  .timesheet-day-cell {
+    aspect-ratio: auto;
+    min-height: 44px;
+    padding: 3px 1px;
+  }
+  .timesheet-day-hours {
+    font-size: 9px;
+  }
+  .timesheet-calendar-weekdays span {
+    font-size: 9.5px;
+  }
+  .timesheet-week-cell {
+    padding: 10px 1px;
+  }
+  .timesheet-week-dayname {
+    font-size: 9px;
+  }
+  .timesheet-day-flag {
+    top: 3px;
+    right: 3px;
   }
 }

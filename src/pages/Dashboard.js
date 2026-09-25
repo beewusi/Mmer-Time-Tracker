@@ -1,12 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import emailjs from '@emailjs/browser';
 import { supabase } from '../supabase';
-import {
-  TEST_MODE, getRecords, addRecord,
-  getTimeOffRequests, addTimeOffRequest, cancelTimeOffRequest,
-  getPublicHolidays, getAvatar,
-  getEmployeeStatus, setEmployeeStatus
-} from '../mockData';
+import { getPublicHolidays } from '../lib/holidays';
 import { callAI } from '../lib/ai';
 import {
   isPushSupported, getNotificationPermission, isDesktopPushEnabled,
@@ -19,59 +14,90 @@ import { PieChart, Pie, Cell, Tooltip } from 'recharts';
 import {
   HourglassIcon, DashboardIcon, TimesheetIcon, BellIcon,
   ClockIcon, CoffeeIcon, CalendarIcon, PinIcon, MoonIcon, SunIcon,
-  ChevronDownIcon, SuitcaseIcon, AlertIcon, RefreshIcon
+  ChevronDownIcon, SuitcaseIcon, AlertIcon, RefreshIcon, HelpIcon,
+  MenuIcon, XIcon
 } from '../icons';
 
 const TIME_OFF_TYPES = ['Annual Leave', 'Sick Leave', 'Unpaid Leave', 'Emergency Leave', 'Compassionate Leave'];
 
-// Grounds the support chat assistant — kept as plain text and handed to
-// the edge function as-is, rather than letting the model improvise
-// beyond what the app actually does.
-const EMPLOYEE_FAQ_TEXT = `
-- To clock in or out, use the buttons on the Clock In card on the Dashboard.
-- Clocking in outside the authorised location still works — it just gets flagged "Unauthorised" until an admin clears it. It never blocks you from working.
-- To take a break, press Break on the Clock In card; press Resume to end it.
-- To request time off, go to the Time Off tab. You can fill the form in yourself, or describe it in plain English and press "Fill form" to have it filled in for you, then check it and press Submit Request.
-- Time off requests need admin approval — check the Time Off tab for the status, and any note left when it's approved or rejected.
-- To change your profile picture, go to Profile and click the pencil icon on your avatar.
-- Email and department can't be changed from your own profile — contact an admin.
-- Dark mode is the toggle in the top right of the Dashboard page.
-- Break reminders appear at 2 hours (a gentle nudge) and 3 hours (a stronger one) of continuous clocked-in time; you're auto clocked out at 8 hours 15 minutes if you forget.
-`;
+// Employee FAQ. Same list goes to the support chat so both give the same
+// answers.
+const EMPLOYEE_FAQ_ITEMS = [
+  {
+    q: 'How do I clock in or out?',
+    a: 'Use the Clock In button on the Clock In card on your Dashboard. When you’re done for the day, press Clock Out on the same card.'
+  },
+  {
+    q: 'What happens if I clock in away from the office?',
+    a: 'You can still clock in, but the session is marked "Unauthorised" and sent to your admin for review. They can either authorise it or decline it. A declined session isn’t counted towards your hours.'
+  },
+  {
+    q: 'Why does my location show N/A?',
+    a: 'Your browser didn’t share your location when you clocked in. Allow location access for this site in your browser settings so your next clock-in can be checked properly.'
+  },
+  {
+    q: 'How do breaks work?',
+    a: 'Press Break on the Clock In card to pause your work timer, then press Resume when you’re back. Your break time is saved separately from your worked hours.'
+  },
+  {
+    q: 'What if I forget to clock out?',
+    a: 'You get reminders at 2 and 3 hours (to take a break) and at 8 hours (to clock out). If you’re still clocked in at 8 hours 15 minutes, you’re clocked out automatically.'
+  },
+  {
+    q: 'How do I request time off?',
+    a: 'Go to the Time Off tab and fill in the form, or describe it in plain English and press "Fill form" to have it filled in for you. Check the details, then press Submit Request.'
+  },
+  {
+    q: 'How do I know if my time off was approved?',
+    a: 'Check "Your requests" on the Time Off tab. It shows the status of each request and any note your admin left when approving or rejecting it. You can cancel a request while it’s still pending.'
+  },
+  {
+    q: 'Can I edit my timesheet?',
+    a: 'No, only an admin can correct a timesheet entry. If something looks wrong, let your admin know which day it is.'
+  },
+  {
+    q: 'How do I change my profile picture or details?',
+    a: 'Click your name at the bottom of the menu to open your Profile, then click the pencil icon on your picture. Your email and department can only be changed by an admin.'
+  },
+  {
+    q: 'How do I switch to dark mode?',
+    a: 'Use the Dark/Light toggle at the top right of the Dashboard page.'
+  }
+];
+
+const EMPLOYEE_FAQ_TEXT = EMPLOYEE_FAQ_ITEMS.map(item => `- ${item.q} ${item.a}`).join('\n');
+
+function locationLabel(status) {
+  if (status === 'authorised') return 'Authorised';
+  if (status === 'unauthorised') return 'Unauthorised';
+  if (status === 'declined') return 'Declined';
+  return 'N/A';
+}
+
+// Declined sessions don't count towards totals.
+function isCounted(record) {
+  return record.location_status !== 'declined';
+}
 
 function Dashboard({ user, onLogout }) {
   const [profile, setProfile] = useState(null);
   const [isClockedIn, setIsClockedIn] = useState(false);
   const [isOnBreak, setIsOnBreak] = useState(false);
   const [seconds, setSeconds] = useState(0);
-  // I'm tracking which of the four session reminders I've already fired,
-  // per clocked-in session, in a ref (not state) because I don't want
-  // setting these to trigger another render/effect pass. I used to check
-  // `seconds === 7200` etc., which only fires on the exact tick where my
-  // counter equals that number. The problem: `seconds` doesn't only move
-  // in steady +1 increments from my local timer — I also overwrite it
-  // every 30s from a server resync (`applyServerClockState`), and I
-  // recompute it from scratch on every mount/refresh. Both of those can
-  // jump `seconds` straight past an exact target value without ever
-  // landing on it, so the reminder silently never fires. Switching the
-  // checks below to `>=` plus these fired-flags means I catch the
-  // threshold even if I jump past it, but still only remind once per
-  // session instead of on every tick after the threshold.
+  // Reminders already fired this session. Ref so it doesn't re-render. Using
+  // >= since seconds can jump past the exact value on a resync or refresh.
   const remindersFiredRef = useRef({
     break2h: false,
     break3h: false,
     clockOut8h: false,
     autoClockOut: false
   });
-  // I'm keeping track of the clock_in_at timestamp my reminder flags were
-  // last reset for. I need this because I don't only start sessions
-  // locally through handleClockIn() — an admin can clock me in from the
-  // Employees tab, and my screen picks that up through the 30s
-  // syncClockStateFromServer() poll instead. Without comparing
-  // timestamps, that route would leave whatever fired-flags were left
-  // over from my previous session in place and could suppress reminders
-  // I should still get on this new one.
+  // clock_in_at the reminder flags were last reset for. Admin clock-ins come
+  // in through the 30s sync, not handleClockIn(), so this is how a new session
+  // gets picked up.
   const lastRemindersResetForRef = useRef(null);
+  // Stops a double-click on Clock Out saving the session twice.
+  const clockOutInProgressRef = useRef(false);
   const [breakSeconds, setBreakSeconds] = useState(0);
   const [reminder, setReminder] = useState('');
   const [clockInTime, setClockInTime] = useState(null);
@@ -91,6 +117,8 @@ function Dashboard({ user, onLogout }) {
   const [locationStatus, setLocationStatus] = useState(null);
   const [locationName, setLocationName] = useState('');
   const [avatarUrl, setAvatarUrl] = useState(null);
+  const [isNavOpen, setIsNavOpen] = useState(false);
+  const [openFaqIndex, setOpenFaqIndex] = useState(null);
 
   // Time off
   const [timeOffRequests, setTimeOffRequests] = useState([]);
@@ -110,20 +138,15 @@ function Dashboard({ user, onLogout }) {
   const [quickFillLoading, setQuickFillLoading] = useState(false);
   const [quickFillError, setQuickFillError] = useState('');
 
-  // Optional reminders the person can toggle on/off. The three reminders
-  // already on the Reminders page are fixed defaults and are left alone.
-  // Location Alerts moved to the admin side — it's about which clock-ins
-  // get flagged for review, not something each employee tunes for themselves.
+  // Optional reminders. The three fixed ones are on the Reminders page.
+  // Location Alerts is an admin setting.
   const [optionalReminders, setOptionalReminders] = useState({
     weeklySummary: false,
     missedClockIn: false
   });
 
-  // Desktop push notification state — separate from optionalReminders
-  // above because this isn't a yes/no preference I just save to the
-  // database, it's tied to whether THIS browser actually has a live,
-  // working subscription right now (which involves the browser's own
-  // permission state too).
+  // Desktop push. Separate from optionalReminders since it depends on this
+  // browser's subscription and permission.
   const [pushSupported, setPushSupported] = useState(true);
   const [pushPermission, setPushPermission] = useState('default');
   const [pushEnabled, setPushEnabled] = useState(false);
@@ -158,9 +181,8 @@ function Dashboard({ user, onLogout }) {
   }
 
   function getUserRole() {
-    // profiles.department is the one an admin actually sets during
-    // approval — user_metadata.department is never written to, so it's
-    // kept only as a harmless fallback for older/test data.
+    // profiles.department is set on approval. user_metadata.department is a
+    // fallback for older accounts.
     return profile?.department || user?.user_metadata?.department || 'Employee';
   }
 
@@ -174,14 +196,12 @@ function Dashboard({ user, onLogout }) {
       loadTimeOff();
       loadProfile();
       syncClockStateFromServer();
-      setAvatarUrl(TEST_MODE ? getAvatar(user.id) : (user?.user_metadata?.avatar_url || null));
+      setAvatarUrl(user?.user_metadata?.avatar_url || null);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user]);
 
   async function loadProfile() {
-    if (TEST_MODE) return;
-
     const { data, error } = await supabase
       .from('profiles')
       .select('*')
@@ -199,22 +219,30 @@ function Dashboard({ user, onLogout }) {
     }
   }
 
-  // Applies a status row from employee_status (or mockData in TEST_MODE)
-  // to the local clock/break state. Used both on first load — so
-  // refreshing the page doesn't lose "currently clocked in" — and on
-  // every periodic sync below, so an admin clocking this employee in,
-  // out, or onto a break from the admin dashboard is reflected here too,
-  // instead of only changing the database while this screen keeps
-  // showing whatever it last showed locally.
+  function applyLocationStatus(value) {
+    if (!value) {
+      setLocationStatus(null);
+      setLocationName('');
+      return;
+    }
+    setLocationStatus(value);
+    if (value === 'authorised') setLocationName('Authorised location');
+    else if (value === 'unauthorised') setLocationName('Unauthorised location');
+    else if (value === 'declined') setLocationName('Clock-in declined by admin');
+    else setLocationName('Location unavailable');
+  }
+
+  // Syncs local clock/break state with the employee_status row. Runs on load
+  // (so a refresh keeps the session) and every 30s (picks up admin changes).
+  // Location comes back from here too so a refresh doesn't lose it.
   function applyServerClockState(status) {
     if (!status || status.status === 'not_clocked_in' || status.status === 'clocked_out') {
       setIsClockedIn(false);
       setIsOnBreak(false);
       setSeconds(0);
       setBreakSeconds(0);
-      // I'm clearing this so that whenever I next go clocked-in — from
-      // any source — it reads as a new session and my reminder flags
-      // get reset below instead of staying stuck from before.
+      applyLocationStatus(null);
+      // Next clock-in counts as a new session so the reminder flags reset.
       lastRemindersResetForRef.current = null;
       return;
     }
@@ -222,10 +250,8 @@ function Dashboard({ user, onLogout }) {
     const clockInAt = status.clock_in_at ? new Date(status.clock_in_at).getTime() : Date.now();
     const breakAccum = status.break_accum_seconds || 0;
 
-    // If this clock_in_at is one I haven't reset my reminder flags for
-    // yet, it's a new session (whether I started it myself or an admin
-    // started it for me) — so I reset the flags now rather than only in
-    // handleClockIn, which this code path doesn't go through.
+    // New clock_in_at = new session (own or admin-started), reset the reminder
+    // flags.
     if (lastRemindersResetForRef.current !== clockInAt) {
       lastRemindersResetForRef.current = clockInAt;
       remindersFiredRef.current = {
@@ -238,6 +264,7 @@ function Dashboard({ user, onLogout }) {
 
     setIsClockedIn(true);
     setClockInTime(new Date(clockInAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
+    applyLocationStatus(status.location_status || null);
 
     if (status.status === 'on_break' && status.break_started_at) {
       const breakStartAt = new Date(status.break_started_at).getTime();
@@ -256,12 +283,10 @@ function Dashboard({ user, onLogout }) {
     applyServerClockState(status);
   }
 
-  // Catches an admin deleting this employee's account while they're
-  // actively signed in, and also keeps time off status current without
-  // the employee needing to refresh the page after an admin approves or
-  // rejects a request.
+  // Every 30s: sign out if the account was deleted, refresh time off and
+  // records, resync clock state.
   useEffect(() => {
-    if (TEST_MODE || !user) return;
+    if (!user) return;
 
     const interval = setInterval(async () => {
       const { data, error } = await supabase
@@ -279,6 +304,7 @@ function Dashboard({ user, onLogout }) {
       }
 
       loadTimeOff();
+      loadRecords();
       syncClockStateFromServer();
     }, 30000);
 
@@ -287,11 +313,6 @@ function Dashboard({ user, onLogout }) {
   }, [user]);
 
   async function loadRecords() {
-    if (TEST_MODE) {
-      setRecords(getRecords(user.id));
-      return;
-    }
-
     const { data, error } = await supabase
       .from('records')
       .select('*')
@@ -304,11 +325,6 @@ function Dashboard({ user, onLogout }) {
   }
 
   async function loadTimeOff() {
-    if (TEST_MODE) {
-      setTimeOffRequests(getTimeOffRequests(user.id));
-      return;
-    }
-
     const { data, error } = await supabase
       .from('time_off_requests')
       .select('*')
@@ -366,19 +382,8 @@ function Dashboard({ user, onLogout }) {
     }
     if (seconds >= 29700 && !fired.autoClockOut) {
       fired.autoClockOut = true;
-      // I originally wrote a comment here claiming the actual clock-out
-      // is handled server-side by a scheduled database job in
-      // supabase/SYNC_AND_AUTOMATION_FIX.sql. I went looking for that
-      // file to fix it and it doesn't exist anywhere in this project —
-      // I never actually built it, I just wrote the comment as if I had.
-      // So right now this reminder, like the others, ONLY fires while
-      // this tab is open and mounted. There is no real auto clock-out
-      // happening anywhere else. I'm leaving this note here instead of
-      // the old comment so I stop trusting a safety net that isn't
-      // there. Until I build the real server-side job (Supabase Edge
-      // Function + pg_cron, checking employee_status.clock_in_at against
-      // now()), I should treat this purely as a heads-up to the
-      // employee, not as something that protects payroll data.
+      // On-screen notice only. The actual auto clock-out happens in reminder-
+      // sweep and the 30s sync picks it up.
       setReminder('You are being automatically clocked out.');
       sendBrowserNotification('Auto Clock Out — Mmerℇ', 'You are being automatically clocked out after 8 hours 15 minutes.');
       sendEmailNotification('Auto Clock Out — Mmerℇ', 'You are being automatically clocked out after 8 hours 15 minutes.');
@@ -415,7 +420,7 @@ function Dashboard({ user, onLogout }) {
 
   function getTotalHoursToday() {
     const today = new Date().toLocaleDateString('en-GB');
-    const todayRecords = records.filter(r => r.date === today);
+    const todayRecords = records.filter(r => r.date === today && isCounted(r));
     let totalSeconds = 0;
     todayRecords.forEach(record => {
       totalSeconds += hmsToSeconds(record.hours_worked);
@@ -442,8 +447,7 @@ function Dashboard({ user, onLogout }) {
   function checkLocation() {
     return new Promise((resolve) => {
       if (!navigator.geolocation) {
-        setLocationStatus('unavailable');
-        setLocationName('Location unavailable');
+        applyLocationStatus('unavailable');
         resolve('unavailable');
         return;
       }
@@ -451,26 +455,24 @@ function Dashboard({ user, onLogout }) {
         (position) => {
           const { latitude, longitude } = position.coords;
           const distance = getDistanceMeters(latitude, longitude, OFFICE_LAT, OFFICE_LNG);
-          if (distance <= ALLOWED_RADIUS_METERS) {
-            setLocationStatus('authorised');
-            setLocationName('Authorised location');
-            resolve('authorised');
-          } else {
-            setLocationStatus('unauthorised');
-            setLocationName('Unauthorised location');
-            resolve('unauthorised');
-          }
+          const result = distance <= ALLOWED_RADIUS_METERS ? 'authorised' : 'unauthorised';
+          applyLocationStatus(result);
+          resolve(result);
         },
         () => {
-          setLocationStatus('unavailable');
-          setLocationName('Location unavailable');
+          applyLocationStatus('unavailable');
           resolve('unavailable');
-        }
+        },
+        // Timeout so Clock In doesn't hang if the location prompt is ignored.
+        { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
       );
     });
   }
 
   async function saveRecord() {
+    // Location from employee_status first (survives a refresh and holds the
+    // admin's authorise/decline), local state as fallback.
+    const serverStatus = await readEmployeeStatus();
     const newRecord = {
       user_id: user.id,
       date: new Date().toLocaleDateString('en-GB'),
@@ -478,14 +480,8 @@ function Dashboard({ user, onLogout }) {
       clock_out: getCurrentTime(),
       hours_worked: formatTime(seconds),
       break_time: formatTime(breakSeconds),
-      location_status: locationStatus || 'unavailable'
+      location_status: serverStatus?.location_status || locationStatus || 'unavailable'
     };
-
-    if (TEST_MODE) {
-      addRecord(newRecord);
-      await loadRecords();
-      return;
-    }
 
     const { data, error } = await supabase
       .from('records')
@@ -511,11 +507,6 @@ function Dashboard({ user, onLogout }) {
   }
 
   function sendEmailNotification(title, message) {
-    if (TEST_MODE) {
-      // No real emails go out during UI testing.
-      console.log('[test mode] would send email:', title, message);
-      return;
-    }
     emailjs.send('service_qo5r5ol', 'template_iyjajm8', {
       title: title,
       to_name: getUsername(),
@@ -526,30 +517,27 @@ function Dashboard({ user, onLogout }) {
     .catch((error) => console.log('Email error:', error));
   }
 
-  // Reads/writes the shared "who's clocked in" status. In TEST_MODE this
-  // is localStorage (mockData.js); otherwise it's the real `employee_status`
-  // Supabase table, which is what lets the admin dashboard — and this
-  // employee's own session on another device — see it live.
+  // employee_status read/write. The admin dashboard reads this live.
   async function readEmployeeStatus() {
-    if (TEST_MODE) return getEmployeeStatus(user.id);
     const { data } = await supabase
       .from('employee_status')
       .select('*')
       .eq('user_id', user.id)
       .maybeSingle();
-    return data || { status: 'not_clocked_in', clock_in_at: null, break_started_at: null, break_accum_seconds: 0 };
+    return data || { status: 'not_clocked_in', clock_in_at: null, break_started_at: null, break_accum_seconds: 0, location_status: null };
   }
 
   async function syncEmployeeStatus(status) {
-    if (TEST_MODE) {
-      setEmployeeStatus(user.id, status);
-      return;
+    const row = { user_id: user.id, ...status, updated_at: new Date().toISOString() };
+    const { error } = await supabase.from('employee_status').upsert(row);
+
+    // Retry without location_status if the column isn't there yet
+    // (supabase/location_status.sql).
+    if (error && String(error.message || '').includes('location_status')) {
+      const withoutLocation = { ...row };
+      delete withoutLocation.location_status;
+      await supabase.from('employee_status').upsert(withoutLocation);
     }
-    await supabase.from('employee_status').upsert({
-      user_id: user.id,
-      ...status,
-      updated_at: new Date().toISOString()
-    });
   }
 
   async function handleClockIn() {
@@ -561,10 +549,7 @@ function Dashboard({ user, onLogout }) {
     setBreakSeconds(0);
     setClockInTime(getCurrentTime());
     requestNotificationPermission();
-    // Brand new session, so I'm clearing my fired-reminder flags — I want
-    // the 2hr/3hr/8hr/auto-clock-out reminders to be able to fire again
-    // for this fresh clock-in, not stay silenced because I already fired
-    // them once during an earlier session today.
+    // New session, reset the reminder flags.
     remindersFiredRef.current = {
       break2h: false,
       break3h: false,
@@ -572,24 +557,20 @@ function Dashboard({ user, onLogout }) {
       autoClockOut: false
     };
 
-    // An unauthorised location no longer blocks the clock-in — it's
-    // allowed through but flagged, and an admin can authorise it later
-    // from the Timesheets tab.
+    // Unauthorised location doesn't block clock-in. It's flagged for the admin
+    // to authorise or decline.
     if (location === 'unauthorised') {
       setReminder('You have been clocked in, but your location could not be verified as authorised. This has been flagged for admin review.');
     }
 
-    // Mirrors this onto the shared status store so the admin dashboard's
-    // Employees tab reflects it without needing a page refresh from them,
-    // and also resets the server-side "have I sent this reminder yet"
-    // flags for the new session — the reminder-sweep cron job (see
-    // supabase/functions/reminder-sweep) checks these before emailing me,
-    // so a fresh clock-in needs to start with all of them false again.
+    // Written to employee_status so the admin sees the clock-in and location
+    // straight away. Reminder-sent flags reset for reminder-sweep.
     await syncEmployeeStatus({
       status: 'clocked_in',
       clock_in_at: new Date().toISOString(),
       break_started_at: null,
       break_accum_seconds: 0,
+      location_status: location,
       break_2h_sent: false,
       break_3h_sent: false,
       clock_out_8h_sent: false,
@@ -598,7 +579,12 @@ function Dashboard({ user, onLogout }) {
   }
 
   async function handleClockOut() {
-    saveRecord();
+    if (clockOutInProgressRef.current) return;
+    clockOutInProgressRef.current = true;
+
+    // Save the record before clearing employee_status, otherwise the location
+    // is already gone.
+    await saveRecord();
     setIsClockedIn(false);
     setIsOnBreak(false);
     setTimeout(() => {
@@ -611,8 +597,10 @@ function Dashboard({ user, onLogout }) {
       status: 'clocked_out',
       clock_in_at: null,
       break_started_at: null,
-      break_accum_seconds: 0
+      break_accum_seconds: 0,
+      location_status: null
     });
+    clockOutInProgressRef.current = false;
   }
 
   async function handleBreak() {
@@ -695,7 +683,7 @@ function Dashboard({ user, onLogout }) {
     return getRecordsForPeriod('all');
   }
 
-  // ---------- Timesheet page: calendar view (mirrors the admin's) ----------
+  // ---------- Timesheet page: calendar view ----------
 
   function parseRecordDate(dateStr) {
     if (!dateStr) return null;
@@ -734,7 +722,7 @@ function Dashboard({ user, onLogout }) {
   }
 
   function sumRecordsSeconds(recs) {
-    return recs.reduce((sum, r) => sum + hmsToSeconds(r.hours_worked), 0);
+    return recs.filter(isCounted).reduce((sum, r) => sum + hmsToSeconds(r.hours_worked), 0);
   }
 
   function buildMonthCells(monthDate) {
@@ -803,18 +791,14 @@ function Dashboard({ user, onLogout }) {
     return sumRecordsSeconds(filteredRecords());
   }
 
-  // Powers the Activities card. "Daily" now adds together any sessions
-  // already completed today (clocked out earlier, e.g. after a lunch
-  // break) with whatever's still live right now — it used to only show
-  // the live timer, so a completed earlier session today vanished from
-  // the total. "Weekly"/"Monthly" already rolled up saved timesheet data
-  // correctly.
+  // Activities card. Daily = sessions finished today + the one running now.
+  // Weekly/Monthly = saved records.
   function getActivitiesStats() {
     if (activitiesFilter === 'daily') {
       const todayRecs = getRecordsForPeriod('today');
       let completedWorked = 0;
       let completedBreak = 0;
-      todayRecs.forEach(r => {
+      todayRecs.filter(isCounted).forEach(r => {
         completedWorked += hmsToSeconds(r.hours_worked);
         completedBreak += hmsToSeconds(r.break_time);
       });
@@ -832,7 +816,7 @@ function Dashboard({ user, onLogout }) {
     const recs = getRecordsForPeriod(period);
     let workedSecondsVal = 0;
     let breakSecondsVal = 0;
-    recs.forEach(r => {
+    recs.filter(isCounted).forEach(r => {
       workedSecondsVal += hmsToSeconds(r.hours_worked);
       breakSecondsVal += hmsToSeconds(r.break_time);
     });
@@ -846,8 +830,8 @@ function Dashboard({ user, onLogout }) {
     };
   }
 
-  // Merges the country's public holidays with the person's own time off
-  // (upcoming and already-taken) for the holidays card.
+  // Public holidays + the employee's time off (upcoming and taken) for the
+  // holidays card.
   function getHolidaysAndTimeOff() {
     const today = new Date();
     today.setHours(0, 0, 0, 0);
@@ -909,18 +893,6 @@ function Dashboard({ user, onLogout }) {
       reason: timeOffReason
     };
 
-    if (TEST_MODE) {
-      addTimeOffRequest(request);
-      setTimeOffRequests(getTimeOffRequests(user.id));
-      setTimeOffSuccess('Your time off request has been submitted for approval.');
-      setTimeOffType('');
-      setTimeOffStart('');
-      setTimeOffEnd('');
-      setTimeOffReason('');
-      setTimeOffSubmitting(false);
-      return;
-    }
-
     const { error } = await supabase
       .from('time_off_requests')
       .insert([{ ...request, status: 'pending' }]);
@@ -941,16 +913,7 @@ function Dashboard({ user, onLogout }) {
   async function handleCancelTimeOff(requestId) {
     setCancellingId(requestId);
 
-    if (TEST_MODE) {
-      cancelTimeOffRequest(requestId);
-      setTimeOffRequests(getTimeOffRequests(user.id));
-      setCancellingId(null);
-      return;
-    }
-
-    // Deleted rather than left in the table — a cancelled request an
-    // employee never sent for approval doesn't need to stick around for
-    // the admin to see.
+    // Deleted instead of marked cancelled, the admin doesn't need to see it.
     await supabase
       .from('time_off_requests')
       .delete()
@@ -966,26 +929,21 @@ function Dashboard({ user, onLogout }) {
     setOptionalReminders(prev => {
       const next = { ...prev, [key]: !prev[key] };
 
-      if (!TEST_MODE) {
-        supabase
-          .from('profiles')
-          .update({ optional_reminders: next })
-          .eq('id', user.id)
-          .then(({ error }) => {
-            if (error) console.log('Failed to save reminder preference:', error);
-          });
-      }
+      supabase
+        .from('profiles')
+        .update({ optional_reminders: next })
+        .eq('id', user.id)
+        .then(({ error }) => {
+          if (error) console.log('Failed to save reminder preference:', error);
+        });
 
       return next;
     });
   }
 
-  // I'm checking this once when the person loads the app (not just when
-  // they open the Reminders page) so the button already shows the right
-  // state — On/Off/Blocked — the first time they see it, rather than
-  // flashing the wrong thing for a moment.
+  // Check push state on load so the toggle shows the right state first time.
   useEffect(() => {
-    if (!user || TEST_MODE) return;
+    if (!user) return;
     setPushSupported(isPushSupported());
     if (isPushSupported()) {
       setPushPermission(getNotificationPermission());
@@ -1002,9 +960,7 @@ function Dashboard({ user, onLogout }) {
       setPushPermission(result.permission);
       setPushEnabled(result.enabled);
       if (!result.enabled) {
-        // They said no (or dismissed) the browser's own permission
-        // prompt — that's their call, not an error on my end. I'm just
-        // reflecting it back accurately rather than pretending it worked.
+        // Permission denied or prompt closed.
         setPushError('Notifications are blocked for this site. You can allow them in your browser\u2019s site settings, then try again.');
       }
     } catch (err) {
@@ -1026,8 +982,8 @@ function Dashboard({ user, onLogout }) {
   }
 
   // ---------- AI: natural-language time off ----------
-  // Parses free text into the request form's fields — the person still
-  // reviews and submits it themselves, this just saves the typing.
+  // Fills the form from a plain-English sentence. Still needs checking and
+  // Submit.
   async function handleQuickFillTimeOff() {
     if (!quickTimeOffText.trim()) return;
     setQuickFillLoading(true);
@@ -1046,8 +1002,8 @@ function Dashboard({ user, onLogout }) {
   }
 
   // ---------- AI: weekly summary ----------
-  // Generated on demand rather than emailed on a schedule — a scheduled
-  // version needs a cron job on the backend, which is a follow-up step.
+  // On demand for now. Weekly email needs a scheduled job on the backend
+  // (todo).
   async function handleGenerateWeeklySummary() {
     setWeeklySummaryLoading(true);
     setWeeklySummaryText('');
@@ -1055,7 +1011,7 @@ function Dashboard({ user, onLogout }) {
       const weekRecords = getRecordsForPeriod('week');
       let workedSecondsTotal = 0;
       let breakSecondsTotal = 0;
-      weekRecords.forEach(r => {
+      weekRecords.filter(isCounted).forEach(r => {
         workedSecondsTotal += hmsToSeconds(r.hours_worked);
         breakSecondsTotal += hmsToSeconds(r.break_time);
       });
@@ -1087,6 +1043,12 @@ function Dashboard({ user, onLogout }) {
     };
   }
 
+  // Close the mobile menu after picking a page.
+  function goToPage(page) {
+    setActivePage(page);
+    setIsNavOpen(false);
+  }
+
   const status = getStatus();
   const activityStats = getActivitiesStats();
   const holidaysData = getHolidaysAndTimeOff();
@@ -1108,49 +1070,66 @@ function Dashboard({ user, onLogout }) {
         </div>
       )}
 
-      {/* Sidebar */}
-      <div className="sidebar">
-        <div className="sidebar-brand">
-          <HourglassIcon width={20} height={20} />
-          <span className="brand-name">Mmerℇ</span>
-        </div>
-        <nav className="sidebar-nav">
-          <button
-            className={`nav-item ${activePage === 'dashboard' ? 'active' : ''}`}
-            onClick={() => setActivePage('dashboard')}>
-            <DashboardIcon width={17} height={17} /> Dashboard
-          </button>
-          <button
-            className={`nav-item ${activePage === 'timesheet' ? 'active' : ''}`}
-            onClick={() => setActivePage('timesheet')}>
-            <TimesheetIcon width={17} height={17} /> Timesheet
-          </button>
-          <button
-            className={`nav-item ${activePage === 'timeoff' ? 'active' : ''}`}
-            onClick={() => setActivePage('timeoff')}>
-            <SuitcaseIcon width={17} height={17} /> Time Off
-          </button>
-          <button
-            className={`nav-item ${activePage === 'reminders' ? 'active' : ''}`}
-            onClick={() => setActivePage('reminders')}>
-            <BellIcon width={17} height={17} /> Reminders
-          </button>
-        </nav>
-        <div
-          className="sidebar-user"
-          onClick={() => setActivePage('profile')}
-          title="Click to view profile">
-          {avatarUrl ? (
-            <img src={avatarUrl} alt="" className="user-avatar user-avatar-img" />
-          ) : (
-            <div className="user-avatar">{getFirstName()[0]}</div>
-          )}
-          <div className="user-info">
-            <p className="user-name">{getUsername()}</p>
-            <p className="user-role">View profile</p>
+      {/* Sidebar (top bar + menu button on smaller screens) */}
+      {isNavOpen && <div className="sidebar-backdrop" onClick={() => setIsNavOpen(false)} />}
+      <div className={`sidebar ${isNavOpen ? 'nav-open' : ''}`}>
+        <div className="sidebar-top">
+          <div className="sidebar-brand">
+            <HourglassIcon width={20} height={20} />
+            <span className="brand-name">Mmerℇ</span>
           </div>
+          <button
+            className="sidebar-menu-toggle"
+            onClick={() => setIsNavOpen(prev => !prev)}
+            aria-label={isNavOpen ? 'Close menu' : 'Open menu'}
+            aria-expanded={isNavOpen}>
+            {isNavOpen ? <XIcon width={18} height={18} /> : <MenuIcon width={18} height={18} />}
+          </button>
         </div>
-        <button className="sidebar-signout" onClick={onLogout}>Sign Out</button>
+        <div className="sidebar-collapsible">
+          <nav className="sidebar-nav">
+            <button
+              className={`nav-item ${activePage === 'dashboard' ? 'active' : ''}`}
+              onClick={() => goToPage('dashboard')}>
+              <DashboardIcon width={17} height={17} /> Dashboard
+            </button>
+            <button
+              className={`nav-item ${activePage === 'timesheet' ? 'active' : ''}`}
+              onClick={() => goToPage('timesheet')}>
+              <TimesheetIcon width={17} height={17} /> Timesheet
+            </button>
+            <button
+              className={`nav-item ${activePage === 'timeoff' ? 'active' : ''}`}
+              onClick={() => goToPage('timeoff')}>
+              <SuitcaseIcon width={17} height={17} /> Time Off
+            </button>
+            <button
+              className={`nav-item ${activePage === 'reminders' ? 'active' : ''}`}
+              onClick={() => goToPage('reminders')}>
+              <BellIcon width={17} height={17} /> Reminders
+            </button>
+            <button
+              className={`nav-item ${activePage === 'faq' ? 'active' : ''}`}
+              onClick={() => goToPage('faq')}>
+              <HelpIcon width={17} height={17} /> FAQ
+            </button>
+          </nav>
+          <div
+            className="sidebar-user"
+            onClick={() => goToPage('profile')}
+            title="Click to view profile">
+            {avatarUrl ? (
+              <img src={avatarUrl} alt="" className="user-avatar user-avatar-img" />
+            ) : (
+              <div className="user-avatar">{getFirstName()[0]}</div>
+            )}
+            <div className="user-info">
+              <p className="user-name">{getUsername()}</p>
+              <p className="user-role">View profile</p>
+            </div>
+          </div>
+          <button className="sidebar-signout" onClick={onLogout}>Sign Out</button>
+        </div>
       </div>
 
       {/* Main Content */}
@@ -1194,7 +1173,7 @@ function Dashboard({ user, onLogout }) {
             {/* Three Cards Row */}
             <div className="three-cards-row">
 
-              {/* Card 1 — Clock In */}
+              {/* Card 1: Clock In */}
               <div className="main-card clock-card">
                 <div className="card-header">
                   <ClockIcon width={17} height={17} className="card-icon" />
@@ -1225,7 +1204,7 @@ function Dashboard({ user, onLogout }) {
                 </div>
               </div>
 
-              {/* Card 2 — Planned Hours */}
+              {/* Card 2: Planned Hours */}
               <div className="main-card planned-card">
                 <div className="card-header">
                   <CalendarIcon width={17} height={17} className="card-icon" />
@@ -1252,7 +1231,7 @@ function Dashboard({ user, onLogout }) {
                 </div>
               </div>
 
-              {/* Card 3 — Worked Hours */}
+              {/* Card 3: Worked Hours */}
               <div className="main-card worked-card">
                 <div className="card-header">
                   <ClockIcon width={17} height={17} className="card-icon" />
@@ -1529,8 +1508,7 @@ function Dashboard({ user, onLogout }) {
                           <span className="timesheet-field-label">Location</span>
                           <p>
                             <span className={`location-tag location-tag-${record.location_status || 'unavailable'}`}>
-                              {record.location_status === 'authorised' ? 'Authorised' :
-                               record.location_status === 'unauthorised' ? 'Unauthorised' : 'N/A'}
+                              {locationLabel(record.location_status)}
                             </span>
                           </p>
                         </div>
@@ -1570,8 +1548,7 @@ function Dashboard({ user, onLogout }) {
                           <td className="cell-success">{record.hours_worked}</td>
                           <td>
                             <span className={`location-tag location-tag-${record.location_status || 'unavailable'}`}>
-                              {record.location_status === 'authorised' ? 'Authorised' :
-                               record.location_status === 'unauthorised' ? 'Unauthorised' : 'N/A'}
+                              {locationLabel(record.location_status)}
                             </span>
                           </td>
                         </tr>
@@ -1826,6 +1803,34 @@ function Dashboard({ user, onLogout }) {
                   <span className="toggle-slider"></span>
                 </label>
               </div>
+            </div>
+          </div>
+        )}
+
+        {/* ===== FAQ PAGE ===== */}
+        {activePage === 'faq' && (
+          <div className="page">
+            <div className="page-header">
+              <div>
+                <h1>FAQ</h1>
+                <p className="page-date">Quick answers to common questions</p>
+              </div>
+            </div>
+
+            <div className="faq-list">
+              {EMPLOYEE_FAQ_ITEMS.map((item, i) => (
+                <div className="faq-item" key={i}>
+                  <button
+                    className="faq-question"
+                    onClick={() => setOpenFaqIndex(openFaqIndex === i ? null : i)}>
+                    {item.q}
+                    <span className="faq-toggle">{openFaqIndex === i ? '−' : '+'}</span>
+                  </button>
+                  {openFaqIndex === i && (
+                    <p className="faq-answer">{item.a}</p>
+                  )}
+                </div>
+              ))}
             </div>
           </div>
         )}

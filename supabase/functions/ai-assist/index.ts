@@ -1,19 +1,14 @@
 // supabase/functions/ai-assist/index.ts
 //
-// One shared edge function behind every AI feature in the app. The
-// frontend always calls this via supabase.functions.invoke('ai-assist',
-// { body: { task, ...payload } }) — it never talks to Google directly,
-// so the API key stays server-side only.
+// One edge function behind every assistant feature. The frontend calls it with
+// supabase.functions.invoke('ai-assist', { body: { task, ...payload } }) so
+// the API key stays server-side.
 //
-// Uses Google's Gemini API (gemini-2.5-flash), which has a genuinely
-// free, non-expiring tier — unlike a trial credit that runs out after a
-// month, this keeps working indefinitely under normal usage.
+// Gemini API (gemini-2.5-flash), free tier.
 //
 // Deploy:  supabase functions deploy ai-assist
-// Get a key: https://aistudio.google.com/app/apikey (free, no card needed)
+// Get a key: https://aistudio.google.com/app/apikey
 // Set key: supabase secrets set GEMINI_API_KEY=AIza...
-//
-// See AI_FEATURES.md for what each task does and why.
 
 const GEMINI_API_KEY = Deno.env.get('GEMINI_API_KEY');
 const MODEL = 'gemini-2.5-flash';
@@ -31,11 +26,8 @@ function jsonResponse(body: unknown, status = 200) {
 }
 
 async function callGemini(system: string, userMessage: string, maxTokens = 400) {
-  // Google is mid-migration from legacy "AIzaSy..." API keys to newer
-  // "AQ...." Authentication Keys. The new format needs to be sent as an
-  // Authorization header, not the old `?key=` query parameter — sending
-  // it the old way is what caused 401 errors with a freshly-generated
-  // AQ key.
+  // New "AQ..." keys have to go in the Authorization header. Sending them as
+  // ?key= gave 401s.
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`;
 
   const res = await fetch(url, {
@@ -58,9 +50,8 @@ async function callGemini(system: string, userMessage: string, maxTokens = 400) 
 
   const data = await res.json();
 
-  // A blocked prompt (safety filters) or an empty response both come
-  // back as a 200 with no usable candidate — surface that clearly
-  // instead of returning an empty string silently.
+  // Blocked prompt or empty response comes back as 200 with no candidate.
+  // Throw instead of returning an empty string.
   const blockReason = data?.promptFeedback?.blockReason;
   if (blockReason) {
     throw new Error(`Gemini blocked this request: ${blockReason}`);
@@ -77,8 +68,7 @@ async function callGemini(system: string, userMessage: string, maxTokens = 400) 
   return text;
 }
 
-// The model is asked for JSON-only, but this strips ```json fences too,
-// in case it adds them anyway.
+// Strip ```json fences in case the model adds them.
 function jsonFromText(text: string) {
   const cleaned = text.replace(/```json|```/g, '').trim();
   return JSON.parse(cleaned);
@@ -124,9 +114,8 @@ Deno.serve(async (req: Request) => {
     }
 
     // ---------- Timesheet anomaly note ----------
-    // The app decides *whether* something is anomalous with plain maths
-    // (see AdminDashboard.js) — the model is only asked to phrase the
-    // note in one neutral sentence, never to judge the number itself.
+    // The app decides what's unusual (AdminDashboard.js). This only words the
+    // note.
     if (task === 'timesheet_anomaly') {
       const { employeeName, date, hoursToday, averageHours } = body;
       const system = "You write one short, neutral sentence flagging a timesheet entry that differs " +

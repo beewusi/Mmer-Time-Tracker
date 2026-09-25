@@ -1,10 +1,7 @@
 // src/lib/push.js
 //
-// TEMPORARY DEBUG VERSION
-//
-// This version is intentionally verbose.
-// It logs every important step so we can see exactly where
-// enabling desktop notifications succeeds or fails.
+// TEMPORARY DEBUG VERSION. Logs every step of enabling desktop notifications
+// to find where it fails.
 
 import { supabase } from '../supabase';
 
@@ -468,8 +465,7 @@ export async function enableDesktopPush(userId) {
       error?.hint
     );
 
-    // IMPORTANT:
-    // Re-throw the error so Dashboard.js can see that enabling failed.
+    // Re-throw so Dashboard.js knows enabling failed.
     throw error;
   }
 }

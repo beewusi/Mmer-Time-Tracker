@@ -3,10 +3,9 @@ import { callAI } from '../lib/ai';
 import { HelpIcon, XIcon } from '../icons';
 import './AIChatWidget.css';
 
-// Floating support assistant, mounted once on the employee dashboard so
-// it's available from any tab. Answers are grounded only in the FAQ
-// text and the employee's own stats passed in via `context` — see
-// buildChatContext() in Dashboard.js.
+// Floating support chat on the employee dashboard, available from any tab.
+// Answers only from the FAQ + the employee's own stats (buildChatContext() in
+// Dashboard.js).
 function AIChatWidget({ context }) {
   const [open, setOpen] = useState(false);
   const [messages, setMessages] = useState([
