@@ -3,13 +3,22 @@
 -- 1. SECURITY DEFINER functions open to anon + authenticated via the API
 -- auto_clock_out_overdue: not called by the app
 -- handle_new_user: sign-up trigger only
-revoke execute on function public.auto_clock_out_overdue() from public, anon, authenticated;
+-- (auto_clock_out_overdue is dropped in 10, skipped once it's gone)
+do $$ begin
+  if to_regprocedure('public.auto_clock_out_overdue()') is not null then
+    revoke execute on function public.auto_clock_out_overdue() from public, anon, authenticated;
+  end if;
+end $$;
 revoke execute on function public.handle_new_user() from public, anon, authenticated;
 
 -- 2. Functions with no fixed search_path
 -- pinned to public so a different search_path can't swap in other objects
 alter function public.handle_new_user() set search_path = public;
-alter function public.auto_clock_out_overdue() set search_path = public;
+do $$ begin
+  if to_regprocedure('public.auto_clock_out_overdue()') is not null then
+    alter function public.auto_clock_out_overdue() set search_path = public;
+  end if;
+end $$;
 alter function public.hms_string set search_path = public;
 
 -- 3. avatars bucket: anyone could list every file in it
@@ -190,3 +199,17 @@ drop trigger if exists protect_employee_status on public.employee_status;
 create trigger protect_employee_status
   before insert or update on public.employee_status
   for each row execute function public.protect_employee_status();
+
+-- 10. old in-database auto clock-out (job auto-clock-out-check) ran alongside
+-- reminder-sweep: double clock-outs, N/A locations, marked as admin-adjusted
+select cron.unschedule(jobid) from cron.job where jobname = 'auto-clock-out-check';
+drop function if exists public.auto_clock_out_overdue();
+
+-- 11. duplicate admin policies: employee_status and time_off_requests had
+-- an is_admin copy of each admin rule next to the email one. Keeping the
+-- email ones only, same as every other table.
+drop policy if exists "employee_status_admin_insert_all" on public.employee_status;
+drop policy if exists "employee_status_admin_select_all" on public.employee_status;
+drop policy if exists "employee_status_admin_update_all" on public.employee_status;
+drop policy if exists "time_off_admin_select_all" on public.time_off_requests;
+drop policy if exists "time_off_admin_update_all" on public.time_off_requests;
