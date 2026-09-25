@@ -138,6 +138,7 @@ function Dashboard({ user, onLogout }) {
   const [timeOffSuccess, setTimeOffSuccess] = useState('');
   const [timeOffSubmitting, setTimeOffSubmitting] = useState(false);
   const [cancellingId, setCancellingId] = useState(null);
+  const [showQuickFill, setShowQuickFill] = useState(false);
 
   // AI features
   const [weeklySummaryText, setWeeklySummaryText] = useState('');
@@ -950,6 +951,80 @@ function Dashboard({ user, onLogout }) {
     return { upcoming, taken };
   }
 
+  // ---------- Time off: day counts ----------
+
+  function toIsoDate(date) {
+    return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+  }
+
+  // Mon-Fri, public holidays don't count. `until` stops the count early
+  // (used for "taken this year" so future days aren't counted yet).
+  function countWorkingDays(startIso, endIso, from = null, until = null) {
+    if (!startIso || !endIso) return 0;
+    const holidays = new Set(getPublicHolidays(getUserCountry()).map(h => h.date));
+    const day = new Date(`${startIso}T00:00:00`);
+    const end = new Date(`${endIso}T00:00:00`);
+    if (from && day < from) day.setTime(from.getTime());
+    let count = 0;
+    while (day <= end && (!until || day <= until)) {
+      const weekday = day.getDay();
+      if (weekday !== 0 && weekday !== 6 && !holidays.has(toIsoDate(day))) count += 1;
+      day.setDate(day.getDate() + 1);
+    }
+    return count;
+  }
+
+  function dayLabel(n) {
+    return `${n} working day${n === 1 ? '' : 's'}`;
+  }
+
+  // "14 Oct", "5–7 Oct", "30 Sep – 2 Oct" (year added when it isn't this year)
+  function formatDateRange(startIso, endIso) {
+    const start = new Date(`${startIso}T00:00:00`);
+    const end = new Date(`${(endIso || startIso)}T00:00:00`);
+    const thisYear = new Date().getFullYear();
+    const year = end.getFullYear() !== thisYear ? ` ${end.getFullYear()}` : '';
+    const month = d => d.toLocaleDateString('en-GB', { month: 'short' });
+    if (startIso === (endIso || startIso)) return `${start.getDate()} ${month(start)}${year}`;
+    if (start.getMonth() === end.getMonth() && start.getFullYear() === end.getFullYear()) {
+      return `${start.getDate()}\u2013${end.getDate()} ${month(end)}${year}`;
+    }
+    return `${start.getDate()} ${month(start)} \u2013 ${end.getDate()} ${month(end)}${year}`;
+  }
+
+  function getTimeOffSummary() {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const todayIso = toIsoDate(today);
+    const yearStart = new Date(today.getFullYear(), 0, 1);
+
+    const pending = timeOffRequests.filter(t => t.status === 'pending').length;
+    const takenDays = timeOffRequests
+      .filter(t => t.status === 'approved' && t.start_date <= todayIso)
+      .reduce((sum, t) => sum + countWorkingDays(t.start_date, t.end_date, yearStart, today), 0);
+    const next = timeOffRequests
+      .filter(t => t.status === 'approved' && (t.end_date || t.start_date) >= todayIso)
+      .sort((a, b) => a.start_date.localeCompare(b.start_date))[0];
+
+    let nextLabel = 'None booked';
+    if (next) nextLabel = next.start_date <= todayIso ? 'On leave now' : formatDateRange(next.start_date, next.start_date);
+
+    return { pending, takenDays, nextLabel };
+  }
+
+  // Pending / Upcoming (approved, not over yet) / History (taken or rejected)
+  function getGroupedTimeOff() {
+    const todayIso = toIsoDate(new Date());
+    const byStart = (a, b) => a.start_date.localeCompare(b.start_date);
+    return {
+      pending: timeOffRequests.filter(t => t.status === 'pending').sort(byStart),
+      upcoming: timeOffRequests.filter(t => t.status === 'approved' && (t.end_date || t.start_date) >= todayIso).sort(byStart),
+      history: timeOffRequests
+        .filter(t => t.status === 'rejected' || (t.status === 'approved' && (t.end_date || t.start_date) < todayIso))
+        .sort((a, b) => byStart(b, a))
+    };
+  }
+
   async function handleTimeOffSubmit() {
     if (!timeOffType || !timeOffStart || !timeOffEnd) {
       setTimeOffError('Please choose a leave type and both dates.');
@@ -958,6 +1033,11 @@ function Dashboard({ user, onLogout }) {
     }
     if (new Date(timeOffEnd) < new Date(timeOffStart)) {
       setTimeOffError('The end date cannot be before the start date.');
+      setTimeOffSuccess('');
+      return;
+    }
+    if (countWorkingDays(timeOffStart, timeOffEnd) === 0) {
+      setTimeOffError('These dates don\u2019t include any working days.');
       setTimeOffSuccess('');
       return;
     }
@@ -1720,149 +1800,206 @@ function Dashboard({ user, onLogout }) {
         )}
 
         {/* ===== TIME OFF PAGE ===== */}
-        {activePage === 'timeoff' && (
-          <div className="page">
-            <div className="page-header">
-              <h1>Time Off</h1>
-              <p className="page-date">Request leave and track past requests</p>
-            </div>
+        {activePage === 'timeoff' && (() => {
+          const summary = getTimeOffSummary();
+          const groups = getGroupedTimeOff();
+          const requestedDays = timeOffStart && timeOffEnd && timeOffEnd >= timeOffStart
+            ? countWorkingDays(timeOffStart, timeOffEnd)
+            : null;
 
-            <div className="timeoff-layout">
-              <div className="timeoff-form-card">
-                <h3>Request time off</h3>
-
-                <div className="ai-quick-fill">
-                  <label>Describe it in plain English (optional)</label>
-                  <div className="ai-quick-fill-row">
-                    <input
-                      type="text"
-                      placeholder="e.g. next Friday off for a doctor's appointment"
-                      value={quickTimeOffText}
-                      onChange={e => setQuickTimeOffText(e.target.value)}
-                    />
+          const renderRequest = req => {
+            const todayIso = toIsoDate(new Date());
+            const days = countWorkingDays(req.start_date, req.end_date || req.start_date);
+            const taken = req.status === 'approved' && (req.end_date || req.start_date) < todayIso;
+            const tag = req.status === 'pending' ? 'pending' : req.status === 'rejected' ? 'rejected' : taken ? 'taken' : 'approved';
+            const tagLabel = { pending: 'Pending', rejected: 'Rejected', taken: 'Taken', approved: 'Approved' }[tag];
+            return (
+              <div className="to-req" key={req.id}>
+                <div className="to-req-main">
+                  <span className="to-req-type">{req.type}</span>
+                  <span className="to-req-meta">{formatDateRange(req.start_date, req.end_date)} {'\u00b7'} {days} day{days === 1 ? '' : 's'}</span>
+                  {req.reason && <span className="to-req-reason">{req.reason}</span>}
+                </div>
+                <div className="to-req-side">
+                  <span className={`holiday-tag holiday-tag-${tag}`}>{tagLabel}</span>
+                  {req.status === 'pending' && (
                     <button
-                      type="button"
-                      className="btn-secondary ai-quick-fill-btn"
-                      onClick={handleQuickFillTimeOff}
-                      disabled={quickFillLoading || !quickTimeOffText.trim()}>
-                      {quickFillLoading ? 'Thinking...' : 'Fill form'}
+                      className="timeoff-cancel-btn"
+                      disabled={cancellingId === req.id}
+                      onClick={() => handleCancelTimeOff(req.id)}>
+                      {cancellingId === req.id ? 'Cancelling...' : 'Cancel'}
                     </button>
-                  </div>
-                  {quickFillError && <p className="form-alert">{quickFillError}</p>}
+                  )}
                 </div>
-
-                {timeOffError && <p className="form-alert">{timeOffError}</p>}
-                {timeOffSuccess && <p className="form-success">{timeOffSuccess}</p>}
-
-                <div className="input-group">
-                  <label>Type</label>
-                  <select
-                    value={timeOffType}
-                    onChange={e => setTimeOffType(e.target.value)}>
-                    <option value="">Select a type</option>
-                    {TIME_OFF_TYPES.map(t => (
-                      <option key={t} value={t}>{t}</option>
-                    ))}
-                  </select>
-                </div>
-
-                <div className="timeoff-dates-row">
-                  <div className="input-group">
-                    <label>Start date</label>
-                    <input
-                      type="date"
-                      value={timeOffStart}
-                      onChange={e => setTimeOffStart(e.target.value)}
-                    />
-                  </div>
-                  <div className="input-group">
-                    <label>End date</label>
-                    <input
-                      type="date"
-                      value={timeOffEnd}
-                      onChange={e => setTimeOffEnd(e.target.value)}
-                    />
-                  </div>
-                </div>
-
-                <div className="input-group">
-                  <label>Reason (optional)</label>
-                  <textarea
-                    rows={3}
-                    placeholder="Add any detail worth sharing with your manager"
-                    value={timeOffReason}
-                    onChange={e => setTimeOffReason(e.target.value)}
-                  />
-                </div>
-
-                <button
-                  className="btn-primary"
-                  onClick={handleTimeOffSubmit}
-                  disabled={timeOffSubmitting}>
-                  {timeOffSubmitting ? 'Submitting...' : 'Submit Request'}
-                </button>
-              </div>
-
-              <div className="timeoff-history-card">
-                <div className="timeoff-history-header">
-                  <h3>Your requests</h3>
-                  <button
-                    type="button"
-                    className={`timeoff-refresh-btn ${timeOffRefreshState === 'refreshing' ? 'is-refreshing' : ''}`}
-                    onClick={handleTimeOffRefresh}
-                    disabled={timeOffRefreshState === 'refreshing'}
-                    title="Check for updates">
-                    {timeOffRefreshState === 'done'
-                      ? <CheckCircleIcon width={14} height={14} />
-                      : <RefreshIcon width={14} height={14} />}
-                    {timeOffRefreshState === 'refreshing' ? 'Refreshing...' : timeOffRefreshState === 'done' ? 'Updated' : 'Refresh'}
-                  </button>
-                </div>
-                {timeOffRequests.length === 0 ? (
-                  <div className="empty-state">
-                    <p>No time off requested yet.</p>
-                  </div>
-                ) : (
-                  <div className="timeoff-history-list">
-                    {timeOffRequests.map((req, i) => (
-                      <div className="timeoff-history-row" key={req.id || i}>
-                        <div className="timeoff-history-row-top">
-                          <div>
-                            <p className="timeoff-history-type">{req.type}</p>
-                            <p className="timeoff-history-dates">
-                              {formatDisplayDate(req.start_date)}
-                              {req.end_date && req.end_date !== req.start_date ? ` – ${formatDisplayDate(req.end_date)}` : ''}
-                            </p>
-                            {req.reason && <p className="timeoff-history-reason">{req.reason}</p>}
-                          </div>
-                          <div className="timeoff-history-status">
-                            <span className={`holiday-tag holiday-tag-${req.status}`}>
-                              {req.status === 'approved' ? 'Approved' : req.status === 'rejected' ? 'Rejected' : 'Pending'}
-                            </span>
-                            {req.status === 'pending' && (
-                              <button
-                                className="timeoff-cancel-btn"
-                                disabled={cancellingId === req.id}
-                                onClick={() => handleCancelTimeOff(req.id)}>
-                                {cancellingId === req.id ? 'Cancelling...' : 'Cancel'}
-                              </button>
-                            )}
-                          </div>
-                        </div>
-                        {req.admin_message && (
-                          <div className="timeoff-history-response">
-                            <span className="timeoff-history-response-label">Admin response</span>
-                            <p className="timeoff-history-response-text">{req.admin_message}</p>
-                          </div>
-                        )}
-                      </div>
-                    ))}
-                  </div>
+                {req.admin_message && (
+                  <p className="to-req-reply"><span>Admin:</span> {req.admin_message}</p>
                 )}
               </div>
+            );
+          };
+
+          return (
+            <div className="page">
+              <div className="page-header">
+                <div>
+                  <h1>Time Off</h1>
+                  <p className="page-date">Request leave and track your requests</p>
+                </div>
+              </div>
+
+              <div className="to-summary">
+                <div className="to-summary-item">
+                  <span className="timesheet-field-label">Pending</span>
+                  <strong>{summary.pending} request{summary.pending === 1 ? '' : 's'}</strong>
+                </div>
+                <div className="to-summary-item">
+                  <span className="timesheet-field-label">Taken this year</span>
+                  <strong>{summary.takenDays} day{summary.takenDays === 1 ? '' : 's'}</strong>
+                </div>
+                <div className="to-summary-item">
+                  <span className="timesheet-field-label">Next time off</span>
+                  <strong>{summary.nextLabel}</strong>
+                </div>
+              </div>
+
+              <div className="timeoff-layout">
+                <div className="timeoff-form-card">
+                  <div className="to-form-head">
+                    <h3>Request time off</h3>
+                    <button type="button" className="to-describe-toggle" onClick={() => setShowQuickFill(prev => !prev)}>
+                      {showQuickFill ? 'Fill in the form instead' : 'Describe it instead'}
+                    </button>
+                  </div>
+
+                  {showQuickFill && (
+                    <div className="to-describe">
+                      <input
+                        type="text"
+                        placeholder="Next Friday off for a doctor's appointment"
+                        value={quickTimeOffText}
+                        onChange={e => setQuickTimeOffText(e.target.value)}
+                      />
+                      <button
+                        type="button"
+                        className="btn-secondary"
+                        onClick={handleQuickFillTimeOff}
+                        disabled={quickFillLoading || !quickTimeOffText.trim()}>
+                        {quickFillLoading ? 'Reading...' : 'Fill form'}
+                      </button>
+                      {quickFillError && <p className="to-describe-error">{quickFillError}</p>}
+                    </div>
+                  )}
+
+                  {timeOffError && <p className="form-alert">{timeOffError}</p>}
+                  {timeOffSuccess && <p className="form-success">{timeOffSuccess}</p>}
+
+                  <div className="input-group">
+                    <label>Type</label>
+                    <select
+                      value={timeOffType}
+                      onChange={e => { setTimeOffType(e.target.value); setTimeOffError(''); }}>
+                      <option value="">Select a type</option>
+                      {TIME_OFF_TYPES.map(t => (
+                        <option key={t} value={t}>{t}</option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div className="timeoff-dates-row">
+                    <div className="input-group">
+                      <label>From</label>
+                      <input
+                        type="date"
+                        value={timeOffStart}
+                        onChange={e => {
+                          setTimeOffStart(e.target.value);
+                          setTimeOffError('');
+                          if (!timeOffEnd || timeOffEnd < e.target.value) setTimeOffEnd(e.target.value);
+                        }}
+                      />
+                    </div>
+                    <div className="input-group">
+                      <label>To</label>
+                      <input
+                        type="date"
+                        value={timeOffEnd}
+                        min={timeOffStart || undefined}
+                        onChange={e => { setTimeOffEnd(e.target.value); setTimeOffError(''); }}
+                      />
+                    </div>
+                  </div>
+
+                  {requestedDays !== null && (
+                    <p className={`to-day-count ${requestedDays === 0 ? 'is-zero' : ''}`}>
+                      {requestedDays === 0 ? 'No working days in these dates (weekend or public holiday)' : dayLabel(requestedDays)}
+                    </p>
+                  )}
+
+                  <div className="input-group">
+                    <label>Reason (optional)</label>
+                    <textarea
+                      rows={2}
+                      placeholder="Anything your manager should know"
+                      value={timeOffReason}
+                      onChange={e => setTimeOffReason(e.target.value)}
+                    />
+                  </div>
+
+                  <button
+                    className="btn-primary"
+                    onClick={handleTimeOffSubmit}
+                    disabled={timeOffSubmitting}>
+                    {timeOffSubmitting ? 'Submitting...' : 'Submit request'}
+                  </button>
+                </div>
+
+                <div className="timeoff-history-card">
+                  <div className="timeoff-history-header">
+                    <h3>Your requests</h3>
+                    <button
+                      type="button"
+                      className={`timeoff-refresh-btn ${timeOffRefreshState === 'refreshing' ? 'is-refreshing' : ''}`}
+                      onClick={handleTimeOffRefresh}
+                      disabled={timeOffRefreshState === 'refreshing'}
+                      title="Check for updates">
+                      {timeOffRefreshState === 'done'
+                        ? <CheckCircleIcon width={14} height={14} />
+                        : <RefreshIcon width={14} height={14} />}
+                      {timeOffRefreshState === 'refreshing' ? 'Refreshing...' : timeOffRefreshState === 'done' ? 'Updated' : 'Refresh'}
+                    </button>
+                  </div>
+
+                  {timeOffRequests.length === 0 ? (
+                    <div className="empty-state">
+                      <p>No time off requested yet.</p>
+                    </div>
+                  ) : (
+                    <>
+                      {groups.pending.length > 0 && (
+                        <div className="to-group">
+                          <span className="to-group-title">Pending</span>
+                          {groups.pending.map(renderRequest)}
+                        </div>
+                      )}
+                      {groups.upcoming.length > 0 && (
+                        <div className="to-group">
+                          <span className="to-group-title">Upcoming</span>
+                          {groups.upcoming.map(renderRequest)}
+                        </div>
+                      )}
+                      {groups.history.length > 0 && (
+                        <div className="to-group">
+                          <span className="to-group-title">History</span>
+                          {groups.history.map(renderRequest)}
+                        </div>
+                      )}
+                    </>
+                  )}
+                </div>
+              </div>
             </div>
-          </div>
-        )}
+          );
+        })()}
 
         {/* ===== REMINDERS PAGE ===== */}
         {activePage === 'reminders' && (
