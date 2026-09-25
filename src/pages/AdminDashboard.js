@@ -4,6 +4,7 @@ import { callAI } from '../lib/ai';
 import {
   parseClockTime, minutesToHHMM, dateToHHMM, formatClock, calculateHoursWorked
 } from '../lib/time';
+import { ClockTimePicker, DurationPicker } from '../components/TimeScrollPicker';
 import './AdminDashboard.css';
 import {
   HourglassIcon, UsersIcon, RefreshIcon, LogoutIcon, TimesheetIcon,
@@ -24,41 +25,6 @@ function locationLabel(status) {
 // Declined sessions stay on the timesheet but don't count towards hours.
 function isCounted(record) {
   return record.location_status !== 'declined';
-}
-
-// Hour / minute / AM-PM dropdowns for editing a clock time. value is "HH:MM" (24h) or ''.
-function ClockTimePicker({ value, onChange }) {
-  const minutes = parseClockTime(value);
-  const h24 = minutes === null ? null : Math.floor(minutes / 60);
-  const hour12 = h24 === null ? '' : String(h24 % 12 === 0 ? 12 : h24 % 12);
-  const minute = minutes === null ? '' : String(minutes % 60).padStart(2, '0');
-  const period = h24 === null ? 'AM' : (h24 < 12 ? 'AM' : 'PM');
-
-  // missing hour/minute (old unreadable times) fill in as 12 / 00
-  function update(next) {
-    const h = Number((next.hour12 ?? hour12) || 12);
-    const m = Number((next.minute ?? minute) || 0);
-    const p = next.period ?? period;
-    onChange(minutesToHHMM(((h % 12) + (p === 'PM' ? 12 : 0)) * 60 + m));
-  }
-
-  return (
-    <div className="clock-time-picker">
-      <select className="admin-edit-input" value={hour12} onChange={e => update({ hour12: e.target.value })} aria-label="Hour">
-        {hour12 === '' && <option value="">--</option>}
-        {Array.from({ length: 12 }, (_, i) => String(i + 1)).map(h => <option key={h} value={h}>{h}</option>)}
-      </select>
-      <span className="clock-time-sep">:</span>
-      <select className="admin-edit-input" value={minute} onChange={e => update({ minute: e.target.value })} aria-label="Minute">
-        {minute === '' && <option value="">--</option>}
-        {Array.from({ length: 60 }, (_, i) => String(i).padStart(2, '0')).map(m => <option key={m} value={m}>{m}</option>)}
-      </select>
-      <select className="admin-edit-input" value={period} onChange={e => update({ period: e.target.value })} aria-label="AM or PM">
-        <option value="AM">AM</option>
-        <option value="PM">PM</option>
-      </select>
-    </div>
-  );
 }
 
 function AdminDashboard({ user, onLogout }) {
@@ -1878,7 +1844,7 @@ function AdminDashboard({ user, onLogout }) {
                             <div>
                               <span className="timesheet-field-label">Break Time</span>
                               {liveEditForm ? (
-                                <input className="admin-edit-input" value={liveEditForm.break_time} placeholder="HH:MM:SS" onChange={e => setLiveEditForm({ ...liveEditForm, break_time: e.target.value })} />
+                                <DurationPicker value={liveEditForm.break_time} onChange={v => setLiveEditForm({ ...liveEditForm, break_time: v })} />
                               ) : (
                                 <p className="cell-warning">{secondsToHms(live.break_accum_seconds || 0)}</p>
                               )}
@@ -1966,13 +1932,13 @@ function AdminDashboard({ user, onLogout }) {
                                 <div>
                                   <span className="timesheet-field-label">Break Time</span>
                                   {isEditing ? (
-                                    <input className="admin-edit-input" value={editForm.break_time} placeholder="HH:MM:SS" onChange={e => updateEditField('break_time', e.target.value)} />
+                                    <DurationPicker value={editForm.break_time} onChange={v => updateEditField('break_time', v)} />
                                   ) : <p className="cell-warning">{record.break_time}</p>}
                                 </div>
                                 <div>
                                   <span className="timesheet-field-label">Hours Worked</span>
                                   {isEditing ? (
-                                    <input className="admin-edit-input" value={editForm.hours_worked} placeholder="HH:MM:SS" onChange={e => updateEditField('hours_worked', e.target.value)} />
+                                    <DurationPicker value={editForm.hours_worked} onChange={v => updateEditField('hours_worked', v)} />
                                   ) : <p className={isDeclined ? 'cell-declined' : 'cell-success'}>{record.hours_worked}</p>}
                                 </div>
                                 <div>

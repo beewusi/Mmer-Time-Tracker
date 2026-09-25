@@ -291,6 +291,30 @@ function Dashboard({ user, onLogout }) {
     applyServerClockState(status);
   }
 
+  // Realtime on my own employee_status row: admin edits, authorise/decline,
+  // clock-outs and auto clock-out show straight away. The 30s poll below
+  // is the backup.
+  useEffect(() => {
+    if (!user) return undefined;
+    const channel = supabase
+      .channel(`employee-status-${user.id}`)
+      .on('postgres_changes', {
+        event: '*',
+        schema: 'public',
+        table: 'employee_status',
+        filter: `user_id=eq.${user.id}`
+      }, () => {
+        syncClockStateFromServer();
+        loadRecords();
+      })
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user]);
+
   // Every 30s: sign out if the account was deleted, refresh time off and
   // records, resync clock state.
   useEffect(() => {

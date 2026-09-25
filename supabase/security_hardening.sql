@@ -16,6 +16,7 @@ alter function public.hms_string set search_path = public;
 -- public URLs still work without a select policy. Kept select for own files
 -- only, since the upload in Profile.js uses upsert (needs select on the file).
 drop policy if exists "avatars_public_read" on storage.objects;
+drop policy if exists "avatars_own_read" on storage.objects;
 create policy "avatars_own_read" on storage.objects
   for select to authenticated
   using (bucket_id = 'avatars' and name like auth.uid()::text || '-%');
@@ -70,10 +71,12 @@ create trigger protect_profile_fields
 -- employees only read + add their own now, admin policies unchanged
 drop policy if exists "allow all" on public.records;
 
+drop policy if exists "records_select_own" on public.records;
 create policy "records_select_own" on public.records
   for select to authenticated
   using (auth.uid() = user_id::uuid);
 
+drop policy if exists "records_insert_own" on public.records;
 create policy "records_insert_own" on public.records
   for insert to authenticated
   with check (auth.uid() = user_id::uuid);
@@ -108,3 +111,82 @@ drop trigger if exists set_record_location on public.records;
 create trigger set_record_location
   before insert on public.records
   for each row execute function public.set_record_location();
+
+-- 8. time_off_requests: employees could add a request that was already approved
+-- new requests have to come in as pending, with no admin reply
+drop policy if exists "time_off_insert_own" on public.time_off_requests;
+
+create policy "time_off_insert_own" on public.time_off_requests
+  for insert to authenticated
+  with check (
+    auth.uid() = user_id
+    and status = 'pending'
+    and admin_message is null
+    and employee_name is null
+  );
+
+-- 9. employee_status: employees could change their own live session
+-- (location, clock-in time, break total)
+-- admin, service role and the SQL editor skip this
+create or replace function public.protect_employee_status()
+returns trigger
+language plpgsql
+set search_path = public
+as $$
+begin
+  if coalesce(auth.jwt() ->> 'email', '') = 'admin@mmer3.com'
+     or coalesce(auth.jwt() ->> 'role', '') = 'service_role'
+     or auth.uid() is null then
+    return new;
+  end if;
+
+  -- the app saves with upsert, which fires the insert trigger first even when
+  -- the row exists. Existing row = leave it to the update part of the upsert.
+  if tg_op = 'INSERT'
+     and exists (select 1 from employee_status where user_id = new.user_id) then
+    return new;
+  end if;
+
+  -- session carrying on: clock-in time and location stay as they were,
+  -- break times measured here instead of trusting the browser
+  if tg_op = 'UPDATE'
+     and old.status in ('clocked_in', 'on_break')
+     and new.status in ('clocked_in', 'on_break') then
+    new.clock_in_at := old.clock_in_at;
+    new.location_status := old.location_status;
+
+    if old.status = 'clocked_in' and new.status = 'on_break' then
+      new.break_started_at := now();
+      new.break_accum_seconds := coalesce(old.break_accum_seconds, 0);
+    elsif old.status = 'on_break' and new.status = 'clocked_in' then
+      new.break_started_at := null;
+      new.break_accum_seconds := coalesce(old.break_accum_seconds, 0)
+        + greatest(0, round(extract(epoch from (now() - coalesce(old.break_started_at, now())))))::int;
+    else
+      new.break_started_at := old.break_started_at;
+      new.break_accum_seconds := coalesce(old.break_accum_seconds, 0);
+    end if;
+
+    return new;
+  end if;
+
+  -- new session: clock-in has to be now (5 min either way)
+  if new.status in ('clocked_in', 'on_break') then
+    if new.clock_in_at is null
+       or new.clock_in_at < now() - interval '5 minutes'
+       or new.clock_in_at > now() + interval '5 minutes' then
+      raise exception 'Clock-in time has to be the current time';
+    end if;
+    new.status := 'clocked_in';
+    new.break_started_at := null;
+    new.break_accum_seconds := 0;
+  end if;
+
+  return new;
+end;
+$$;
+
+drop trigger if exists protect_employee_status on public.employee_status;
+create trigger protect_employee_status
+  before insert or update on public.employee_status
+  for each row execute function public.protect_employee_status();
