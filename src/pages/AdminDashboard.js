@@ -870,7 +870,8 @@ function AdminDashboard({ user, onLogout }) {
   function getWeekRange(date) {
     const start = new Date(date);
     start.setHours(0, 0, 0, 0);
-    start.setDate(start.getDate() - start.getDay());
+    // weeks run Monday to Sunday
+    start.setDate(start.getDate() - ((start.getDay() + 6) % 7));
     const end = new Date(start);
     end.setDate(start.getDate() + 6);
     end.setHours(23, 59, 59, 999);
@@ -884,7 +885,7 @@ function AdminDashboard({ user, onLogout }) {
   function buildCalendarCells(monthDate) {
     const year = monthDate.getFullYear();
     const month = monthDate.getMonth();
-    const startWeekday = new Date(year, month, 1).getDay();
+    const startWeekday = (new Date(year, month, 1).getDay() + 6) % 7; // Monday first
     const daysInMonth = new Date(year, month + 1, 0).getDate();
 
     const cells = [];
@@ -1776,7 +1777,7 @@ function AdminDashboard({ user, onLogout }) {
                 {timesheetViewMode === 'monthly' && (
                   <div className="timesheet-calendar-card">
                     <div className="timesheet-calendar-weekdays">
-                      {['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map(d => (
+                      {['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'].map(d => (
                         <span key={d}>{d}</span>
                       ))}
                     </div>
