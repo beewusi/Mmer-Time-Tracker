@@ -138,3 +138,23 @@ input:focus-visible,
 .sidebar-backdrop {
   display: none;
 }
+
+/* ---------- Refresh buttons ---------- */
+@keyframes mmer-spin {
+  to { transform: rotate(360deg); }
+}
+
+.is-refreshing svg {
+  animation: mmer-spin 0.8s linear infinite;
+}
+
+.refresh-btn:disabled,
+.timeoff-refresh-btn:disabled {
+  cursor: default;
+  opacity: 0.75;
+}
+
+/* Room for the sticky top bar when a day's entries scroll into view */
+.timesheet-day-detail {
+  scroll-margin-top: 80px;
+}

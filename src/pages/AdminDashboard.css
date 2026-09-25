@@ -1613,3 +1613,41 @@
     right: 3px;
   }
 }
+
+/* ---------- Timesheet editing ---------- */
+.clock-time-picker {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 2px;
+}
+
+.clock-time-picker .admin-edit-input {
+  width: auto;
+  padding: 6px 4px;
+  background: #FFFFFF;
+  cursor: pointer;
+}
+
+.clock-time-sep {
+  font-weight: 700;
+  color: var(--gray-500);
+}
+
+.record-adjusted-tag {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--gray-500);
+  background: var(--gray-100);
+  padding: 3px 8px;
+  border-radius: 999px;
+}
+
+.admin-layout.dark .clock-time-picker .admin-edit-input {
+  background: var(--navy-700);
+}
+
+.admin-layout.dark .record-adjusted-tag {
+  background: rgba(248, 250, 252, 0.08);
+  color: var(--gray-300);
+}

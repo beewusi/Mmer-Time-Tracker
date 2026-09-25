@@ -1,6 +1,9 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { supabase } from '../supabase';
 import { callAI } from '../lib/ai';
+import {
+  parseClockTime, minutesToHHMM, dateToHHMM, formatClock, calculateHoursWorked
+} from '../lib/time';
 import './AdminDashboard.css';
 import {
   HourglassIcon, UsersIcon, RefreshIcon, LogoutIcon, TimesheetIcon,
@@ -21,6 +24,41 @@ function locationLabel(status) {
 // Declined sessions stay on the timesheet but don't count towards hours.
 function isCounted(record) {
   return record.location_status !== 'declined';
+}
+
+// Hour / minute / AM-PM dropdowns for editing a clock time. value is "HH:MM" (24h) or ''.
+function ClockTimePicker({ value, onChange }) {
+  const minutes = parseClockTime(value);
+  const h24 = minutes === null ? null : Math.floor(minutes / 60);
+  const hour12 = h24 === null ? '' : String(h24 % 12 === 0 ? 12 : h24 % 12);
+  const minute = minutes === null ? '' : String(minutes % 60).padStart(2, '0');
+  const period = h24 === null ? 'AM' : (h24 < 12 ? 'AM' : 'PM');
+
+  // missing hour/minute (old unreadable times) fill in as 12 / 00
+  function update(next) {
+    const h = Number((next.hour12 ?? hour12) || 12);
+    const m = Number((next.minute ?? minute) || 0);
+    const p = next.period ?? period;
+    onChange(minutesToHHMM(((h % 12) + (p === 'PM' ? 12 : 0)) * 60 + m));
+  }
+
+  return (
+    <div className="clock-time-picker">
+      <select className="admin-edit-input" value={hour12} onChange={e => update({ hour12: e.target.value })} aria-label="Hour">
+        {hour12 === '' && <option value="">--</option>}
+        {Array.from({ length: 12 }, (_, i) => String(i + 1)).map(h => <option key={h} value={h}>{h}</option>)}
+      </select>
+      <span className="clock-time-sep">:</span>
+      <select className="admin-edit-input" value={minute} onChange={e => update({ minute: e.target.value })} aria-label="Minute">
+        {minute === '' && <option value="">--</option>}
+        {Array.from({ length: 60 }, (_, i) => String(i).padStart(2, '0')).map(m => <option key={m} value={m}>{m}</option>)}
+      </select>
+      <select className="admin-edit-input" value={period} onChange={e => update({ period: e.target.value })} aria-label="AM or PM">
+        <option value="AM">AM</option>
+        <option value="PM">PM</option>
+      </select>
+    </div>
+  );
 }
 
 function AdminDashboard({ user, onLogout }) {
@@ -74,6 +112,9 @@ function AdminDashboard({ user, onLogout }) {
   const [liveTick, setLiveTick] = useState(Date.now());
   const [isNavOpen, setIsNavOpen] = useState(false);
   const [locationSavingId, setLocationSavingId] = useState(null);
+  const [refreshState, setRefreshState] = useState('idle');
+  const dayDetailRef = useRef(null);
+  const scrollToDetailRef = useRef(false);
 
   useEffect(() => {
     loadData();
@@ -569,8 +610,8 @@ function AdminDashboard({ user, onLogout }) {
     await supabase.from('records').insert([{
       user_id: employeeId,
       date: now.toLocaleDateString('en-GB'),
-      clock_in: clockInAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-      clock_out: now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      clock_in: dateToHHMM(clockInAt),
+      clock_out: dateToHHMM(now),
       hours_worked: secondsToHms(totalSeconds),
       break_time: secondsToHms(current?.break_accum_seconds || 0),
       location_status: current?.location_status || 'unavailable',
@@ -593,12 +634,27 @@ function AdminDashboard({ user, onLogout }) {
   // ---------- Timesheet editing ----------
 
   function startEdit(record) {
+    const inMinutes = parseClockTime(record.clock_in);
+    const outMinutes = parseClockTime(record.clock_out);
     setEditingRecordId(record.id);
     setEditForm({
-      clock_in: record.clock_in || '',
-      clock_out: record.clock_out || '',
+      clock_in: inMinutes === null ? '' : minutesToHHMM(inMinutes),
+      clock_out: outMinutes === null ? '' : minutesToHHMM(outMinutes),
       break_time: record.break_time || '',
       hours_worked: record.hours_worked || ''
+    });
+  }
+
+  // Hours worked recalculated whenever clock in / out / break changes.
+  // Still editable by hand after that.
+  function updateEditField(field, value) {
+    setEditForm(prev => {
+      const next = { ...prev, [field]: value };
+      if (field !== 'hours_worked') {
+        const hours = calculateHoursWorked(next.clock_in, next.clock_out, next.break_time);
+        if (hours !== null) next.hours_worked = hours;
+      }
+      return next;
     });
   }
 
@@ -607,10 +663,52 @@ function AdminDashboard({ user, onLogout }) {
   }
 
   async function saveEdit(recordId) {
-    await supabase.from('records').update(editForm).eq('id', recordId);
-    await loadData();
+    const { error } = await supabase.from('records').update({ ...editForm, adjusted_by_admin: true }).eq('id', recordId);
+    if (error) {
+      console.log('Failed to save edit:', error);
+      return;
+    }
     cancelEdit();
+    await loadData(true);
   }
+
+  // Spinner on the refresh buttons, then "Updated" for a moment.
+  // Min 600ms so the spin is actually visible on a fast connection.
+  async function handleRefresh() {
+    if (refreshState === 'refreshing') return;
+    setRefreshState('refreshing');
+    await Promise.all([loadData(true), new Promise(resolve => setTimeout(resolve, 600))]);
+    setRefreshState('done');
+    setTimeout(() => setRefreshState('idle'), 1500);
+  }
+
+  function renderRefreshButton() {
+    return (
+      <button
+        className={`refresh-btn ${refreshState === 'refreshing' ? 'is-refreshing' : ''}`}
+        onClick={handleRefresh}
+        disabled={refreshState === 'refreshing'}>
+        {refreshState === 'done'
+          ? <CheckCircleIcon width={15} height={15} />
+          : <RefreshIcon width={15} height={15} />}
+        {refreshState === 'refreshing' ? 'Refreshing...' : refreshState === 'done' ? 'Updated' : 'Refresh'}
+      </button>
+    );
+  }
+
+  // Day click on the calendar/week: scroll down to that day's entries.
+  function selectTimesheetDay(day) {
+    scrollToDetailRef.current = true;
+    setTimesheetSelectedDate(day);
+  }
+
+  useEffect(() => {
+    if (!scrollToDetailRef.current) return;
+    scrollToDetailRef.current = false;
+    requestAnimationFrame(() => {
+      if (dayDetailRef.current) dayDetailRef.current.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
+  }, [timesheetSelectedDate]);
 
   // ---------- Unauthorised clock-ins: authorise / decline ----------
 
@@ -1286,9 +1384,7 @@ function AdminDashboard({ user, onLogout }) {
                 <h1>Sign-Up Approvals</h1>
                 <p className="admin-date">Set a department and approve new accounts, or reject them</p>
               </div>
-              <button className="refresh-btn" onClick={loadData}>
-                <RefreshIcon width={15} height={15} /> Refresh
-              </button>
+              {renderRefreshButton()}
             </div>
 
             {approvalsError && <p className="admin-confirm-error">{approvalsError}</p>}
@@ -1385,9 +1481,7 @@ function AdminDashboard({ user, onLogout }) {
                 <h1>Admin Dashboard</h1>
                 <p className="admin-date">{getCurrentDate()}</p>
               </div>
-              <button className="refresh-btn" onClick={loadData}>
-                <RefreshIcon width={15} height={15} /> Refresh
-              </button>
+              {renderRefreshButton()}
             </div>
 
             {/* Stats Row */}
@@ -1518,9 +1612,7 @@ function AdminDashboard({ user, onLogout }) {
                 <h1>Timesheets</h1>
                 <p className="admin-date">Pick an employee, browse their calendar, review unauthorised clock-ins and approve completed months</p>
               </div>
-              <button className="refresh-btn" onClick={loadData}>
-                <RefreshIcon width={15} height={15} /> Refresh
-              </button>
+              {renderRefreshButton()}
             </div>
 
             {loading ? (
@@ -1612,7 +1704,7 @@ function AdminDashboard({ user, onLogout }) {
                           <button
                             key={day.toISOString()}
                             className={`timesheet-day-cell ${dayRecords.length ? 'has-records' : ''} ${isSelected ? 'selected' : ''} ${isToday ? 'today' : ''}`}
-                            onClick={() => setTimesheetSelectedDate(day)}>
+                            onClick={() => selectTimesheetDay(day)}>
                             <span className="timesheet-day-number">{day.getDate()}</span>
                             {dayRecords.length > 0 && (
                               <span className="timesheet-day-hours">{secondsToHms(totalSecs).slice(0, 5)}</span>
@@ -1645,7 +1737,7 @@ function AdminDashboard({ user, onLogout }) {
                           <button
                             key={day.toISOString()}
                             className={`timesheet-week-cell ${dayRecords.length ? 'has-records' : ''} ${isSelected ? 'selected' : ''} ${isToday ? 'today' : ''}`}
-                            onClick={() => setTimesheetSelectedDate(day)}>
+                            onClick={() => selectTimesheetDay(day)}>
                             <span className="timesheet-week-dayname">{day.toLocaleDateString('en-GB', { weekday: 'short' })}</span>
                             <span className="timesheet-week-daynum">{day.getDate()}</span>
                             {dayRecords.length > 0 && (
@@ -1667,7 +1759,7 @@ function AdminDashboard({ user, onLogout }) {
                   const monthLocked = !!(timesheetApproval && timesheetApproval.approved);
 
                   return (
-                    <div className="timesheet-day-detail">
+                    <div className="timesheet-day-detail" ref={dayDetailRef}>
                       <h3>
                         {activeDay.toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })}
                       </h3>
@@ -1679,7 +1771,7 @@ function AdminDashboard({ user, onLogout }) {
                             <div>
                               <span className="timesheet-field-label">Clock In</span>
                               <p>
-                                {new Date(live.clock_in_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                                {formatClock(dateToHHMM(new Date(live.clock_in_at)))}
                                 {live.location_status === 'unauthorised' && (
                                   <span className="timesheet-record-flag" title="Unauthorised location" />
                                 )}
@@ -1741,10 +1833,10 @@ function AdminDashboard({ user, onLogout }) {
                                 <div>
                                   <span className="timesheet-field-label">Clock In</span>
                                   {isEditing ? (
-                                    <input className="admin-edit-input" value={editForm.clock_in} onChange={e => setEditForm({ ...editForm, clock_in: e.target.value })} />
+                                    <ClockTimePicker value={editForm.clock_in} onChange={v => updateEditField('clock_in', v)} />
                                   ) : (
                                     <p>
-                                      {record.clock_in}
+                                      {formatClock(record.clock_in)}
                                       {needsReview && <span className="timesheet-record-flag" title="Unauthorised location" />}
                                     </p>
                                   )}
@@ -1752,19 +1844,19 @@ function AdminDashboard({ user, onLogout }) {
                                 <div>
                                   <span className="timesheet-field-label">Clock Out</span>
                                   {isEditing ? (
-                                    <input className="admin-edit-input" value={editForm.clock_out} onChange={e => setEditForm({ ...editForm, clock_out: e.target.value })} />
-                                  ) : <p>{record.clock_out}</p>}
+                                    <ClockTimePicker value={editForm.clock_out} onChange={v => updateEditField('clock_out', v)} />
+                                  ) : <p>{formatClock(record.clock_out)}</p>}
                                 </div>
                                 <div>
                                   <span className="timesheet-field-label">Break Time</span>
                                   {isEditing ? (
-                                    <input className="admin-edit-input" value={editForm.break_time} onChange={e => setEditForm({ ...editForm, break_time: e.target.value })} />
+                                    <input className="admin-edit-input" value={editForm.break_time} placeholder="HH:MM:SS" onChange={e => updateEditField('break_time', e.target.value)} />
                                   ) : <p className="cell-warning">{record.break_time}</p>}
                                 </div>
                                 <div>
                                   <span className="timesheet-field-label">Hours Worked</span>
                                   {isEditing ? (
-                                    <input className="admin-edit-input" value={editForm.hours_worked} onChange={e => setEditForm({ ...editForm, hours_worked: e.target.value })} />
+                                    <input className="admin-edit-input" value={editForm.hours_worked} placeholder="HH:MM:SS" onChange={e => updateEditField('hours_worked', e.target.value)} />
                                   ) : <p className={isDeclined ? 'cell-declined' : 'cell-success'}>{record.hours_worked}</p>}
                                 </div>
                                 <div>
@@ -1777,6 +1869,9 @@ function AdminDashboard({ user, onLogout }) {
                                 </div>
                               </div>
                               <div className="timesheet-day-record-actions">
+                                {record.adjusted_by_admin && !isEditing && (
+                                  <span className="record-adjusted-tag">Adjusted by admin</span>
+                                )}
                                 {isEditing ? (
                                   <>
                                     <button className="admin-link-btn" onClick={() => saveEdit(record.id)}>Save</button>
@@ -1826,9 +1921,7 @@ function AdminDashboard({ user, onLogout }) {
                 <h1>Time Off</h1>
                 <p className="admin-date">Approve or reject requests from your team</p>
               </div>
-              <button className="refresh-btn" onClick={loadData}>
-                <RefreshIcon width={15} height={15} /> Refresh
-              </button>
+              {renderRefreshButton()}
             </div>
 
             {selectedTimeOffIds.length > 0 && (

@@ -3,6 +3,7 @@ import emailjs from '@emailjs/browser';
 import { supabase } from '../supabase';
 import { getPublicHolidays } from '../lib/holidays';
 import { callAI } from '../lib/ai';
+import { dateToHHMM, formatClock } from '../lib/time';
 import {
   isPushSupported, getNotificationPermission, isDesktopPushEnabled,
   enableDesktopPush, disableDesktopPush
@@ -14,7 +15,7 @@ import { PieChart, Pie, Cell, Tooltip } from 'recharts';
 import {
   HourglassIcon, DashboardIcon, TimesheetIcon, BellIcon,
   ClockIcon, CoffeeIcon, CalendarIcon, PinIcon, MoonIcon, SunIcon,
-  ChevronDownIcon, SuitcaseIcon, AlertIcon, RefreshIcon, HelpIcon,
+  ChevronDownIcon, SuitcaseIcon, AlertIcon, RefreshIcon, HelpIcon, CheckCircleIcon,
   MenuIcon, XIcon
 } from '../icons';
 
@@ -119,6 +120,9 @@ function Dashboard({ user, onLogout }) {
   const [avatarUrl, setAvatarUrl] = useState(null);
   const [isNavOpen, setIsNavOpen] = useState(false);
   const [openFaqIndex, setOpenFaqIndex] = useState(null);
+  const [timeOffRefreshState, setTimeOffRefreshState] = useState('idle');
+  const dayDetailRef = useRef(null);
+  const scrollToDetailRef = useRef(false);
 
   // Time off
   const [timeOffRequests, setTimeOffRequests] = useState([]);
@@ -418,10 +422,11 @@ function Dashboard({ user, onLogout }) {
     return (parts[0] || 0) * 3600 + (parts[1] || 0) * 60 + (parts[2] || 0);
   }
 
+  // Finished sessions today + the one still running (same as Activities)
   function getTotalHoursToday() {
     const today = new Date().toLocaleDateString('en-GB');
     const todayRecords = records.filter(r => r.date === today && isCounted(r));
-    let totalSeconds = 0;
+    let totalSeconds = isClockedIn ? seconds : 0;
     todayRecords.forEach(record => {
       totalSeconds += hmsToSeconds(record.hours_worked);
     });
@@ -476,8 +481,8 @@ function Dashboard({ user, onLogout }) {
     const newRecord = {
       user_id: user.id,
       date: new Date().toLocaleDateString('en-GB'),
-      clock_in: clockInTime,
-      clock_out: getCurrentTime(),
+      clock_in: serverStatus?.clock_in_at ? dateToHHMM(new Date(serverStatus.clock_in_at)) : clockInTime,
+      clock_out: dateToHHMM(new Date()),
       hours_worked: formatTime(seconds),
       break_time: formatTime(breakSeconds),
       location_status: serverStatus?.location_status || locationStatus || 'unavailable'
@@ -1043,6 +1048,29 @@ function Dashboard({ user, onLogout }) {
     };
   }
 
+  // Spinner on the Time Off refresh button, then "Updated" for a moment.
+  async function handleTimeOffRefresh() {
+    if (timeOffRefreshState === 'refreshing') return;
+    setTimeOffRefreshState('refreshing');
+    await Promise.all([loadTimeOff(), new Promise(resolve => setTimeout(resolve, 600))]);
+    setTimeOffRefreshState('done');
+    setTimeout(() => setTimeOffRefreshState('idle'), 1500);
+  }
+
+  // Day click on the calendar/week: scroll down to that day's entries.
+  function selectTimesheetDay(day) {
+    scrollToDetailRef.current = true;
+    setTimesheetSelectedDate(day);
+  }
+
+  useEffect(() => {
+    if (!scrollToDetailRef.current) return;
+    scrollToDetailRef.current = false;
+    requestAnimationFrame(() => {
+      if (dayDetailRef.current) dayDetailRef.current.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
+  }, [timesheetSelectedDate]);
+
   // Close the mobile menu after picking a page.
   function goToPage(page) {
     setActivePage(page);
@@ -1250,7 +1278,7 @@ function Dashboard({ user, onLogout }) {
                   <div className="planned-divider"></div>
                   <p className="worked-label">Sessions Today</p>
                   <div className="worked-sessions">
-                    {getRecordsForPeriod('today').length}
+                    {getRecordsForPeriod('today').length + (isClockedIn ? 1 : 0)}
                   </div>
                   <div className="planned-divider"></div>
                   <p className="planned-note">Total time worked today, not including break time.</p>
@@ -1433,7 +1461,7 @@ function Dashboard({ user, onLogout }) {
                       <button
                         key={day.toISOString()}
                         className={`timesheet-day-cell ${dayRecs.length ? 'has-records' : ''} ${isSelected ? 'selected' : ''} ${isToday ? 'today' : ''}`}
-                        onClick={() => setTimesheetSelectedDate(day)}>
+                        onClick={() => selectTimesheetDay(day)}>
                         <span className="timesheet-day-number">{day.getDate()}</span>
                         {dayRecs.length > 0 && (
                           <span className="timesheet-day-hours">{formatTime(totalSecs).slice(0, 5)}</span>
@@ -1464,7 +1492,7 @@ function Dashboard({ user, onLogout }) {
                       <button
                         key={day.toISOString()}
                         className={`timesheet-week-cell ${dayRecs.length ? 'has-records' : ''} ${isSelected ? 'selected' : ''} ${isToday ? 'today' : ''}`}
-                        onClick={() => setTimesheetSelectedDate(day)}>
+                        onClick={() => selectTimesheetDay(day)}>
                         <span className="timesheet-week-dayname">{day.toLocaleDateString('en-GB', { weekday: 'short' })}</span>
                         <span className="timesheet-week-daynum">{day.getDate()}</span>
                         {dayRecs.length > 0 && (
@@ -1478,7 +1506,7 @@ function Dashboard({ user, onLogout }) {
             })()}
 
             {timesheetViewMode !== 'all' && (timesheetViewMode !== 'monthly' || timesheetSelectedDate) && (
-              <div className="timesheet-day-detail">
+              <div className="timesheet-day-detail" ref={dayDetailRef}>
                 <h3>
                   {getActiveTimesheetDate().toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })}
                 </h3>
@@ -1490,11 +1518,11 @@ function Dashboard({ user, onLogout }) {
                       <div className="timesheet-day-record-grid">
                         <div>
                           <span className="timesheet-field-label">Clock In</span>
-                          <p>{record.clock_in}</p>
+                          <p>{formatClock(record.clock_in)}</p>
                         </div>
                         <div>
                           <span className="timesheet-field-label">Clock Out</span>
-                          <p>{record.clock_out}</p>
+                          <p>{formatClock(record.clock_out)}</p>
                         </div>
                         <div>
                           <span className="timesheet-field-label">Break Time</span>
@@ -1542,8 +1570,8 @@ function Dashboard({ user, onLogout }) {
                       {filteredRecords().map((record, index) => (
                         <tr key={index}>
                           <td>{record.date}</td>
-                          <td>{record.clock_in}</td>
-                          <td>{record.clock_out}</td>
+                          <td>{formatClock(record.clock_in)}</td>
+                          <td>{formatClock(record.clock_out)}</td>
                           <td className="cell-warning">{record.break_time}</td>
                           <td className="cell-success">{record.hours_worked}</td>
                           <td>
@@ -1650,10 +1678,14 @@ function Dashboard({ user, onLogout }) {
                   <h3>Your requests</h3>
                   <button
                     type="button"
-                    className="timeoff-refresh-btn"
-                    onClick={loadTimeOff}
+                    className={`timeoff-refresh-btn ${timeOffRefreshState === 'refreshing' ? 'is-refreshing' : ''}`}
+                    onClick={handleTimeOffRefresh}
+                    disabled={timeOffRefreshState === 'refreshing'}
                     title="Check for updates">
-                    <RefreshIcon width={14} height={14} /> Refresh
+                    {timeOffRefreshState === 'done'
+                      ? <CheckCircleIcon width={14} height={14} />
+                      : <RefreshIcon width={14} height={14} />}
+                    {timeOffRefreshState === 'refreshing' ? 'Refreshing...' : timeOffRefreshState === 'done' ? 'Updated' : 'Refresh'}
                   </button>
                 </div>
                 {timeOffRequests.length === 0 ? (
