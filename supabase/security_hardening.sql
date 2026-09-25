@@ -23,3 +23,88 @@ create policy "avatars_own_read" on storage.objects
 -- 4. Leaked password protection
 -- Pro plan only, left off for now. Stronger password rules set in the
 -- dashboard instead (Authentication > Sign In / Providers > Email).
+
+-- RLS fixes
+
+-- 5. profiles readable by anyone with the anon key (names, emails, status, is_admin)
+-- own profile + admin policies already cover what the app needs
+drop policy if exists "Public profiles are viewable by everyone" on public.profiles;
+
+-- 6. employees could change their own status / is_admin / department
+-- profiles are only created by handle_new_user, so no insert policy needed
+drop policy if exists "Users can insert their own profile" on public.profiles;
+
+-- admin, service role and the sign-up trigger can change anything,
+-- everyone else only their own name, avatar and reminder settings
+create or replace function public.protect_profile_fields()
+returns trigger
+language plpgsql
+set search_path = public
+as $$
+begin
+  if coalesce(auth.jwt() ->> 'email', '') = 'admin@mmer3.com'
+     or coalesce(auth.jwt() ->> 'role', '') = 'service_role'
+     or auth.uid() is null then
+    return new;
+  end if;
+
+  if new.status is distinct from old.status
+     or new.is_admin is distinct from old.is_admin
+     or new.department is distinct from old.department
+     or new.email is distinct from old.email
+     or new.id is distinct from old.id then
+    raise exception 'Only an admin can change status, admin access, department or email';
+  end if;
+
+  return new;
+end;
+$$;
+
+drop trigger if exists protect_profile_fields on public.profiles;
+create trigger protect_profile_fields
+  before update on public.profiles
+  for each row execute function public.protect_profile_fields();
+
+-- 7. records: "allow all" let employees edit and delete their own sessions,
+-- including hours_worked and location_status
+-- employees only read + add their own now, admin policies unchanged
+drop policy if exists "allow all" on public.records;
+
+create policy "records_select_own" on public.records
+  for select to authenticated
+  using (auth.uid() = user_id::uuid);
+
+create policy "records_insert_own" on public.records
+  for insert to authenticated
+  with check (auth.uid() = user_id::uuid);
+
+-- location on an employee's own record comes from their employee_status row
+-- (where the admin's authorise/decline is saved), not from the browser
+create or replace function public.set_record_location()
+returns trigger
+language plpgsql
+set search_path = public
+as $$
+declare
+  live_location text;
+begin
+  if coalesce(auth.jwt() ->> 'email', '') = 'admin@mmer3.com'
+     or coalesce(auth.jwt() ->> 'role', '') = 'service_role'
+     or auth.uid() is null then
+    return new;
+  end if;
+
+  select location_status into live_location
+  from employee_status
+  where user_id::text = new.user_id::text;
+
+  new.location_status := coalesce(live_location, 'unavailable');
+  new.adjusted_by_admin := false;
+  return new;
+end;
+$$;
+
+drop trigger if exists set_record_location on public.records;
+create trigger set_record_location
+  before insert on public.records
+  for each row execute function public.set_record_location();
