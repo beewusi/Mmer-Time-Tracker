@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect } from 'react';
 import { supabase } from '../supabase';
 import { PencilIcon } from '../icons';
+import PasswordInput from '../components/PasswordInput';
 import './Profile.css';
 
 function Profile({ user, profile, onProfileUpdate, onBack, isDarkMode, avatarUrl, onAvatarChange }) {
@@ -15,6 +16,16 @@ function Profile({ user, profile, onProfileUpdate, onBack, isDarkMode, avatarUrl
   const [loading, setLoading] = useState(false);
   const [avatarError, setAvatarError] = useState('');
   const fileInputRef = useRef(null);
+
+  const [currentPassword, setCurrentPassword] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [passwordError, setPasswordError] = useState('');
+  const [passwordSuccess, setPasswordSuccess] = useState('');
+  const [passwordLoading, setPasswordLoading] = useState(false);
+
+  // Google-only accounts have no password yet, so nothing to check first
+  const hasPassword = (user?.app_metadata?.providers || [user?.app_metadata?.provider]).includes('email');
 
   // profile loads async in Dashboard, sync the name in once it arrives.
   useEffect(() => {
@@ -57,6 +68,56 @@ function Profile({ user, profile, onProfileUpdate, onBack, isDarkMode, avatarUrl
       onProfileUpdate?.();
     }
     setLoading(false);
+  }
+
+  // Current password is checked first so a laptop left signed in
+  // can't be used to change it.
+  async function handlePasswordChange() {
+    setPasswordError('');
+    setPasswordSuccess('');
+
+    if ((hasPassword && !currentPassword) || !newPassword || !confirmPassword) {
+      setPasswordError('Please fill in all the fields.');
+      return;
+    }
+    if (newPassword.length < 6) {
+      setPasswordError('New password must be at least 6 characters.');
+      return;
+    }
+    if (newPassword !== confirmPassword) {
+      setPasswordError('New passwords do not match.');
+      return;
+    }
+    if (hasPassword && newPassword === currentPassword) {
+      setPasswordError('New password is the same as the current one.');
+      return;
+    }
+
+    setPasswordLoading(true);
+
+    if (hasPassword) {
+      const { error: checkError } = await supabase.auth.signInWithPassword({
+        email: user.email,
+        password: currentPassword
+      });
+      if (checkError) {
+        setPasswordLoading(false);
+        setPasswordError('Current password is incorrect.');
+        return;
+      }
+    }
+
+    const { error: updateError } = await supabase.auth.updateUser({ password: newPassword });
+    setPasswordLoading(false);
+
+    if (updateError) {
+      setPasswordError(updateError.message);
+      return;
+    }
+    setCurrentPassword('');
+    setNewPassword('');
+    setConfirmPassword('');
+    setPasswordSuccess(hasPassword ? 'Password updated.' : 'Password set. You can now sign in with your email too.');
   }
 
   function handleAvatarClick() {
@@ -151,6 +212,7 @@ function Profile({ user, profile, onProfileUpdate, onBack, isDarkMode, avatarUrl
           </p>
         </div>
 
+        <div className="profile-cards">
         {/* Edit Form */}
         <div className="profile-form-card">
           <h3>Edit Profile</h3>
@@ -206,6 +268,48 @@ function Profile({ user, profile, onProfileUpdate, onBack, isDarkMode, avatarUrl
             disabled={loading}>
             {loading ? 'Saving...' : 'Save Changes'}
           </button>
+        </div>
+
+        {/* Password */}
+        <div className="profile-form-card">
+          <h3>{hasPassword ? 'Change Password' : 'Set a Password'}</h3>
+
+          {passwordError && <p className="form-alert">{passwordError}</p>}
+          {passwordSuccess && <p className="form-success">{passwordSuccess}</p>}
+
+          {hasPassword && (
+            <PasswordInput
+              id="current-password"
+              label="Current Password"
+              placeholder="Enter your current password"
+              value={currentPassword}
+              onChange={e => setCurrentPassword(e.target.value)}
+            />
+          )}
+
+          <PasswordInput
+            id="new-password"
+            label="New Password"
+            placeholder="Minimum 6 characters"
+            value={newPassword}
+            onChange={e => setNewPassword(e.target.value)}
+          />
+
+          <PasswordInput
+            id="confirm-new-password"
+            label="Confirm New Password"
+            placeholder="Repeat your new password"
+            value={confirmPassword}
+            onChange={e => setConfirmPassword(e.target.value)}
+          />
+
+          <button
+            className="save-btn"
+            onClick={handlePasswordChange}
+            disabled={passwordLoading}>
+            {passwordLoading ? 'Updating...' : 'Update Password'}
+          </button>
+        </div>
         </div>
 
       </div>

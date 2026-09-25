@@ -6,7 +6,7 @@ import './ResetPassword.css';
 
 // Opened from the password-reset email link (PASSWORD_RECOVERY event in
 // App.js).
-function ResetPassword({ onGoToLogin }) {
+function ResetPassword({ onGoToLogin, onDone }) {
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
   const [error, setError] = useState('');
@@ -36,7 +36,8 @@ function ResetPassword({ onGoToLogin }) {
     if (error) {
       setError(error.message);
     } else {
-      setSuccess('Password updated successfully. You can now sign in.');
+      setSuccess('Password updated. Taking you in...');
+      setTimeout(() => onDone?.(), 1200);
     }
   }
 

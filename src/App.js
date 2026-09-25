@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { supabase, ADMIN_EMAIL } from './supabase';
 import Login from './pages/Login';
 import SignUp from './pages/SignUp';
@@ -13,6 +13,9 @@ function App() {
   const [page, setPage] = useState('login');
   const [pendingStatus, setPendingStatus] = useState('pending');
   const [loading, setLoading] = useState(true);
+  // Opened from a password reset link. Stays on the set new password screen
+  // until it's saved, even though Supabase has already signed them in.
+  const recoveryRef = useRef(/type=recovery/.test(window.location.hash + window.location.search));
 
   // Admin is identified by ADMIN_EMAIL and skips approval. Everyone else needs
   // profiles.status = 'approved'.
@@ -37,11 +40,22 @@ function App() {
     return 'dashboard';
   }
 
+  // Normal routing after sign-in, skipped while a password reset is in progress.
+  // Checked again after the await since the recovery event can land in between.
+  async function routeSignedInUser(sessionUser) {
+    if (recoveryRef.current) {
+      setPage('reset-password');
+      return;
+    }
+    const next = await resolvePageForUser(sessionUser);
+    setPage(recoveryRef.current ? 'reset-password' : next);
+  }
+
   useEffect(() => {
     supabase.auth.getSession().then(async ({ data: { session } }) => {
       if (session) {
         setUser(session.user);
-        setPage(await resolvePageForUser(session.user));
+        await routeSignedInUser(session.user);
       }
       setLoading(false);
     });
@@ -50,13 +64,16 @@ function App() {
       async (event, session) => {
         // Password reset link goes to the set new password screen.
         if (event === 'PASSWORD_RECOVERY') {
+          recoveryRef.current = true;
+          if (session) setUser(session.user);
           setPage('reset-password');
           return;
         }
         if (session) {
           setUser(session.user);
-          setPage(await resolvePageForUser(session.user));
+          await routeSignedInUser(session.user);
         } else {
+          recoveryRef.current = false;
           setUser(null);
           setPage('login');
         }
@@ -64,9 +81,25 @@ function App() {
     );
 
     return () => subscription.unsubscribe();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // New password saved from the reset link: tidy the link out of the
+  // address bar and carry on into the app (they're already signed in).
+  async function finishPasswordReset() {
+    recoveryRef.current = false;
+    window.history.replaceState(null, '', window.location.pathname);
+    const { data: { session } } = await supabase.auth.getSession();
+    if (session) {
+      setUser(session.user);
+      setPage(await resolvePageForUser(session.user));
+    } else {
+      setPage('login');
+    }
+  }
+
   async function handleLogout() {
+    recoveryRef.current = false;
     await supabase.auth.signOut();
     setUser(null);
     setPage('login');
@@ -103,7 +136,7 @@ function App() {
       )}
 
       {page === 'reset-password' && (
-        <ResetPassword onGoToLogin={() => setPage('login')} />
+        <ResetPassword onGoToLogin={handleLogout} onDone={finishPasswordReset} />
       )}
 
       {page === 'pending-approval' && (

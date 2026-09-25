@@ -121,6 +121,47 @@
   margin: 0;
 }
 
+.profile-cards {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+/* password fields, same look as the sign in page */
+.profile-page .password-field {
+  position: relative;
+  display: flex;
+}
+
+.profile-page .password-field input {
+  flex: 1;
+  min-width: 0;
+  padding-right: 42px;
+}
+
+.profile-page .password-toggle {
+  position: absolute;
+  right: 6px;
+  top: 50%;
+  transform: translateY(-50%);
+  border: none;
+  background: none;
+  color: var(--gray-500);
+  cursor: pointer;
+  padding: 6px;
+  display: flex;
+  align-items: center;
+}
+
+.profile-page .password-toggle:hover {
+  color: var(--navy);
+}
+
+.profile-page.dark .password-toggle {
+  color: var(--gray-300);
+}
+
 .profile-form-card {
   background: #FFFFFF;
   border: var(--border);
