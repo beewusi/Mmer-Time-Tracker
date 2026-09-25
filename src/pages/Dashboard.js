@@ -1036,6 +1036,11 @@ function Dashboard({ user, onLogout }) {
       setTimeOffSuccess('');
       return;
     }
+    if (timeOffStart < toIsoDate(new Date())) {
+      setTimeOffError('Time off can\u2019t start in the past.');
+      setTimeOffSuccess('');
+      return;
+    }
     if (countWorkingDays(timeOffStart, timeOffEnd) === 0) {
       setTimeOffError('These dates don\u2019t include any working days.');
       setTimeOffSuccess('');
@@ -1911,6 +1916,7 @@ function Dashboard({ user, onLogout }) {
                       <input
                         type="date"
                         value={timeOffStart}
+                        min={toIsoDate(new Date())}
                         onChange={e => {
                           setTimeOffStart(e.target.value);
                           setTimeOffError('');
@@ -1923,7 +1929,7 @@ function Dashboard({ user, onLogout }) {
                       <input
                         type="date"
                         value={timeOffEnd}
-                        min={timeOffStart || undefined}
+                        min={timeOffStart || toIsoDate(new Date())}
                         onChange={e => { setTimeOffEnd(e.target.value); setTimeOffError(''); }}
                       />
                     </div>

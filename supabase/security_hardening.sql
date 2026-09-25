@@ -213,3 +213,17 @@ drop policy if exists "employee_status_admin_select_all" on public.employee_stat
 drop policy if exists "employee_status_admin_update_all" on public.employee_status;
 drop policy if exists "time_off_admin_select_all" on public.time_off_requests;
 drop policy if exists "time_off_admin_update_all" on public.time_off_requests;
+
+-- 12. time off could be requested for days that already passed
+-- same insert rule as 8, plus the start date can't be before today
+drop policy if exists "time_off_insert_own" on public.time_off_requests;
+
+create policy "time_off_insert_own" on public.time_off_requests
+  for insert to authenticated
+  with check (
+    auth.uid() = user_id
+    and status = 'pending'
+    and admin_message is null
+    and employee_name is null
+    and start_date::date >= current_date
+  );
