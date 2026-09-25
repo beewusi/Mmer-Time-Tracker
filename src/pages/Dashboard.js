@@ -3,7 +3,7 @@ import emailjs from '@emailjs/browser';
 import { supabase } from '../supabase';
 import { getPublicHolidays } from '../lib/holidays';
 import { callAI } from '../lib/ai';
-import { dateToHHMM, formatClock } from '../lib/time';
+import { dateToHHMM, formatClock, parseClockTime, minutesToHHMM, formatDuration } from '../lib/time';
 import {
   isPushSupported, getNotificationPermission, isDesktopPushEnabled,
   enableDesktopPush, disableDesktopPush
@@ -11,6 +11,7 @@ import {
 import './Dashboard.css';
 import Profile from './Profile';
 import AIChatWidget from '../components/AIChatWidget';
+import SessionTimeline from '../components/SessionTimeline';
 import { PieChart, Pie, Cell, Tooltip } from 'recharts';
 import {
   HourglassIcon, DashboardIcon, TimesheetIcon, BellIcon,
@@ -102,6 +103,7 @@ function Dashboard({ user, onLogout }) {
   const [breakSeconds, setBreakSeconds] = useState(0);
   // finished breaks this session (breakSeconds is only the current break)
   const [breakAccumSeconds, setBreakAccumSeconds] = useState(0);
+  const [breakList, setBreakList] = useState([]);
   const [reminder, setReminder] = useState('');
   const [clockInTime, setClockInTime] = useState(null);
   const [records, setRecords] = useState([]);
@@ -345,6 +347,7 @@ function Dashboard({ user, onLogout }) {
   }, [user]);
 
   async function loadRecords() {
+    loadBreaks();
     const { data, error } = await supabase
       .from('records')
       .select('*')
@@ -354,6 +357,16 @@ function Dashboard({ user, onLogout }) {
     if (!error && data) {
       setRecords(data);
     }
+  }
+
+  // Own breaks, one row each (supabase/breaks.sql). Empty if not set up yet.
+  async function loadBreaks() {
+    const { data, error } = await supabase
+      .from('breaks')
+      .select('*')
+      .eq('user_id', user.id)
+      .order('started_at', { ascending: true });
+    setBreakList(error ? [] : (data || []));
   }
 
   async function loadTimeOff() {
@@ -1120,6 +1133,37 @@ function Dashboard({ user, onLogout }) {
     setTimeout(() => setTimeOffRefreshState('idle'), 1500);
   }
 
+  // Sessions for the timeline (components/SessionTimeline), read only here
+  function breakToModel(b) {
+    return {
+      id: b.id,
+      start: dateToHHMM(new Date(b.started_at)),
+      end: b.ended_at ? dateToHHMM(new Date(b.ended_at)) : null
+    };
+  }
+
+  function recordToSession(record) {
+    const inMinutes = parseClockTime(record.clock_in);
+    const outMinutes = parseClockTime(record.clock_out);
+    return {
+      clockIn: inMinutes === null ? '' : minutesToHHMM(inMinutes),
+      clockOut: outMinutes === null ? '' : minutesToHHMM(outMinutes),
+      breaks: breakList.filter(b => b.record_id === String(record.id)).map(breakToModel),
+      breakTotal: record.break_time || '00:00:00',
+      declined: record.location_status === 'declined'
+    };
+  }
+
+  function liveSession() {
+    return {
+      clockIn: clockInTime,
+      clockOut: null,
+      breaks: breakList.filter(b => !b.record_id).map(breakToModel),
+      breakTotal: formatTime(getLiveBreakSeconds()),
+      declined: locationStatus === 'declined'
+    };
+  }
+
   // Day click on the calendar/week: scroll down to that day's entries.
   function selectTimesheetDay(day) {
     scrollToDetailRef.current = true;
@@ -1568,79 +1612,70 @@ function Dashboard({ user, onLogout }) {
               );
             })()}
 
-            {timesheetViewMode !== 'all' && (timesheetViewMode !== 'monthly' || timesheetSelectedDate) && (
-              <div className="timesheet-day-detail" ref={dayDetailRef}>
-                <h3>
-                  {getActiveTimesheetDate().toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })}
-                </h3>
-                {isClockedIn && isSameCalendarDay(getActiveTimesheetDate(), new Date()) && (
-                  <div className="timesheet-day-record">
-                    <div className="timesheet-day-record-grid">
-                      <div>
-                        <span className="timesheet-field-label">Clock In</span>
-                        <p>{formatClock(clockInTime)}</p>
-                      </div>
-                      <div>
-                        <span className="timesheet-field-label">Clock Out</span>
-                        <p>{isOnBreak ? 'On break' : 'In progress'}</p>
-                      </div>
-                      <div>
-                        <span className="timesheet-field-label">Break Time</span>
-                        <p className="cell-warning">{formatTime(getLiveBreakSeconds())}</p>
-                      </div>
-                      <div>
-                        <span className="timesheet-field-label">Hours Worked</span>
-                        <p className="cell-success">{formatTime(seconds)}</p>
-                      </div>
-                      <div>
-                        <span className="timesheet-field-label">Location</span>
-                        <p>
-                          <span className={`location-tag location-tag-${locationStatus || 'unavailable'}`}>
-                            {locationLabel(locationStatus)}
-                          </span>
-                        </p>
-                      </div>
-                    </div>
-                  </div>
-                )}
-                {getRecordsForDay(getActiveTimesheetDate()).length === 0 ? (
-                  !(isClockedIn && isSameCalendarDay(getActiveTimesheetDate(), new Date())) && (
+            {timesheetViewMode !== 'all' && (timesheetViewMode !== 'monthly' || timesheetSelectedDate) && (() => {
+              const activeDay = getActiveTimesheetDate();
+              const dayRecs = [...getRecordsForDay(activeDay)]
+                .sort((a, b) => (parseClockTime(a.clock_in) ?? 0) - (parseClockTime(b.clock_in) ?? 0));
+              const showLive = isClockedIn && isSameCalendarDay(activeDay, new Date());
+              const workedTotal = sumRecordsSeconds(dayRecs) + (showLive ? seconds : 0);
+              const breakTotal = dayRecs.filter(isCounted).reduce((sum, r) => sum + hmsToSeconds(r.break_time), 0)
+                + (showLive ? getLiveBreakSeconds() : 0);
+              const sessionCount = dayRecs.length + (showLive ? 1 : 0);
+
+              return (
+                <div className="timesheet-day-detail" ref={dayDetailRef}>
+                  <h3>
+                    {activeDay.toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })}
+                  </h3>
+                  {sessionCount === 0 ? (
                     <p className="timesheet-day-empty">No session recorded this day.</p>
-                  )
-                ) : (
-                  getRecordsForDay(getActiveTimesheetDate()).map((record, i) => (
-                    <div className="timesheet-day-record" key={record.id || i}>
-                      <div className="timesheet-day-record-grid">
-                        <div>
-                          <span className="timesheet-field-label">Clock In</span>
-                          <p>{formatClock(record.clock_in)}</p>
+                  ) : (
+                    <>
+                      <div className="day-summary">
+                        <div className="day-summary-item">
+                          <span className="timesheet-field-label">Worked</span>
+                          <strong>{formatDuration(workedTotal)}</strong>
                         </div>
-                        <div>
-                          <span className="timesheet-field-label">Clock Out</span>
-                          <p>{formatClock(record.clock_out)}</p>
+                        <div className="day-summary-item">
+                          <span className="timesheet-field-label">Breaks</span>
+                          <strong>{formatDuration(breakTotal)}</strong>
                         </div>
-                        <div>
-                          <span className="timesheet-field-label">Break Time</span>
-                          <p className="cell-warning">{record.break_time}</p>
+                        <div className="day-summary-item">
+                          <span className="timesheet-field-label">Sessions</span>
+                          <strong>{sessionCount}</strong>
                         </div>
-                        <div>
-                          <span className="timesheet-field-label">Hours Worked</span>
-                          <p className="cell-success">{record.hours_worked}</p>
-                        </div>
-                        <div>
-                          <span className="timesheet-field-label">Location</span>
-                          <p>
+                      </div>
+
+                      {dayRecs.map((record, i) => (
+                        <div className="day-session" key={record.id || i}>
+                          <div className="day-session-head">
+                            <span className="day-session-title">Session {i + 1}</span>
                             <span className={`location-tag location-tag-${record.location_status || 'unavailable'}`}>
                               {locationLabel(record.location_status)}
                             </span>
-                          </p>
+                          </div>
+                          <SessionTimeline session={recordToSession(record)} />
                         </div>
-                      </div>
-                    </div>
-                  ))
-                )}
-              </div>
-            )}
+                      ))}
+
+                      {showLive && (
+                        <div className="day-session">
+                          <div className="day-session-head">
+                            <span className="day-session-title">
+                              Session {dayRecs.length + 1} {'\u00b7'} {isOnBreak ? 'On break' : 'In progress'}
+                            </span>
+                            <span className={`location-tag location-tag-${locationStatus || 'unavailable'}`}>
+                              {locationLabel(locationStatus)}
+                            </span>
+                          </div>
+                          <SessionTimeline session={liveSession()} />
+                        </div>
+                      )}
+                    </>
+                  )}
+                </div>
+              );
+            })()}
 
             {timesheetViewMode === 'all' && (
               filteredRecords().length === 0 ? (

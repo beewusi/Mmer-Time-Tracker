@@ -2,9 +2,11 @@ import { useState, useEffect, useRef } from 'react';
 import { supabase } from '../supabase';
 import { callAI } from '../lib/ai';
 import {
-  parseClockTime, minutesToHHMM, dateToHHMM, formatClock, calculateHoursWorked
+  parseClockTime, minutesToHHMM, dateToHHMM, calculateHoursWorked,
+  parseRecordDate as parseRecordDateValue, clockTimeOnDate, sumBreakSeconds,
+  minutesAfter, formatDuration
 } from '../lib/time';
-import { ClockTimePicker, DurationPicker } from '../components/TimeScrollPicker';
+import SessionTimeline from '../components/SessionTimeline';
 import './AdminDashboard.css';
 import {
   HourglassIcon, UsersIcon, RefreshIcon, LogoutIcon, TimesheetIcon,
@@ -54,8 +56,6 @@ function AdminDashboard({ user, onLogout }) {
   const [statusFilter, setStatusFilter] = useState('all');
   const [selectedEmployee, setSelectedEmployee] = useState(null);
 
-  const [editingRecordId, setEditingRecordId] = useState(null);
-  const [editForm, setEditForm] = useState({ clock_in: '', clock_out: '', break_time: '', hours_worked: '' });
   const [timesheetEmployeeId, setTimesheetEmployeeId] = useState('');
   const [timesheetMonthDate, setTimesheetMonthDate] = useState(() => {
     const d = new Date();
@@ -79,8 +79,8 @@ function AdminDashboard({ user, onLogout }) {
   const [isNavOpen, setIsNavOpen] = useState(false);
   const [locationSavingId, setLocationSavingId] = useState(null);
   const [refreshState, setRefreshState] = useState('idle');
-  const [liveEditForm, setLiveEditForm] = useState(null);
-  const [liveEditError, setLiveEditError] = useState('');
+  const [breaks, setBreaks] = useState([]);
+
   const dayDetailRef = useRef(null);
   const scrollToDetailRef = useRef(false);
 
@@ -97,10 +97,6 @@ function AdminDashboard({ user, onLogout }) {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [employees]);
-
-  useEffect(() => {
-    setLiveEditForm(null);
-  }, [timesheetEmployeeId]);
 
   useEffect(() => {
     if (timesheetEmployeeId) {
@@ -176,6 +172,16 @@ function AdminDashboard({ user, onLogout }) {
     const map = {};
     (data || []).forEach(row => { map[row.user_id] = row; });
     setEmployeeStatuses(map);
+    await loadBreaks();
+  }
+
+  // Individual breaks (supabase/breaks.sql). Empty if the table isn't there yet.
+  async function loadBreaks() {
+    const { data, error } = await supabase
+      .from('breaks')
+      .select('*')
+      .order('started_at', { ascending: true });
+    setBreaks(error ? [] : (data || []));
   }
 
   async function loadData(silent = false) {
@@ -610,45 +616,142 @@ function AdminDashboard({ user, onLogout }) {
     await loadData();
   }
 
-  // ---------- Timesheet editing ----------
+  // ---------- Breaks + session editing ----------
+  // The day view shows each session as a timeline (components/SessionTimeline).
+  // It hands back { clockIn, clockOut, breaks, breakTotal } and these save it.
 
-  function startEdit(record) {
+  function getRecordBreaks(record) {
+    return breaks.filter(b => b.record_id === String(record.id));
+  }
+
+  // breaks of a session that hasn't been saved yet
+  function getLiveBreaks(userId) {
+    return breaks.filter(b => b.user_id === userId && !b.record_id);
+  }
+
+  function breakToModel(b) {
+    return {
+      id: b.id,
+      start: dateToHHMM(new Date(b.started_at)),
+      end: b.ended_at ? dateToHHMM(new Date(b.ended_at)) : null
+    };
+  }
+
+  function recordToSession(record) {
     const inMinutes = parseClockTime(record.clock_in);
     const outMinutes = parseClockTime(record.clock_out);
-    setEditingRecordId(record.id);
-    setEditForm({
-      clock_in: inMinutes === null ? '' : minutesToHHMM(inMinutes),
-      clock_out: outMinutes === null ? '' : minutesToHHMM(outMinutes),
-      break_time: record.break_time || '',
-      hours_worked: record.hours_worked || ''
-    });
+    return {
+      clockIn: inMinutes === null ? '' : minutesToHHMM(inMinutes),
+      clockOut: outMinutes === null ? '' : minutesToHHMM(outMinutes),
+      breaks: getRecordBreaks(record).map(breakToModel),
+      breakTotal: record.break_time || '00:00:00',
+      declined: record.location_status === 'declined'
+    };
   }
 
-  // Hours worked recalculated whenever clock in / out / break changes.
-  // Still editable by hand after that.
-  function updateEditField(field, value) {
-    setEditForm(prev => {
-      const next = { ...prev, [field]: value };
-      if (field !== 'hours_worked') {
-        const hours = calculateHoursWorked(next.clock_in, next.clock_out, next.break_time);
-        if (hours !== null) next.hours_worked = hours;
-      }
-      return next;
-    });
+  function liveToSession(live, userId) {
+    return {
+      clockIn: dateToHHMM(new Date(live.clock_in_at)),
+      clockOut: null,
+      breaks: getLiveBreaks(userId).map(breakToModel),
+      breakTotal: secondsToHms(live.break_accum_seconds || 0),
+      declined: live.location_status === 'declined'
+    };
   }
 
-  function cancelEdit() {
-    setEditingRecordId(null);
+  // Break list -> timestamps, counted from the real clock-in moment
+  function breakTimestamps(b, clockInAt, clockInHHMM) {
+    const startAt = new Date(clockInAt.getTime() + minutesAfter(clockInHHMM, b.start) * 60000);
+    const endAt = b.end === null ? null : new Date(clockInAt.getTime() + minutesAfter(clockInHHMM, b.end) * 60000);
+    return { started_at: startAt.toISOString(), ended_at: endAt ? endAt.toISOString() : null };
   }
 
-  async function saveEdit(recordId) {
-    const { error } = await supabase.from('records').update({ ...editForm, adjusted_by_admin: true }).eq('id', recordId);
+  // removed ones deleted, changed ones updated, new ones added
+  async function saveBreakList(original, list, clockInAt, clockInHHMM, extra) {
+    const keptIds = list.filter(b => b.id).map(b => b.id);
+    const removed = original.filter(b => !keptIds.includes(b.id)).map(b => b.id);
+    if (removed.length > 0) {
+      const { error } = await supabase.from('breaks').delete().in('id', removed);
+      if (error) return error;
+    }
+    for (const b of list) {
+      const times = breakTimestamps(b, clockInAt, clockInHHMM);
+      // eslint-disable-next-line no-await-in-loop
+      const { error } = b.id
+        ? await supabase.from('breaks').update(times).eq('id', b.id)
+        : await supabase.from('breaks').insert([{ ...extra, ...times }]);
+      if (error) return error;
+    }
+    return null;
+  }
+
+  // Saved session (a row in records)
+  async function saveRecordSession(record, model) {
+    const breakTime = model.breaks.length > 0
+      ? secondsToHms(sumBreakSeconds(model.breaks))
+      : model.breakTotal;
+    const hoursWorked = calculateHoursWorked(model.clockIn, model.clockOut, breakTime);
+
+    // record date is the clock-out day, so a shift past midnight clocked in the day before
+    const recordDay = parseRecordDateValue(record.date);
+    const overnight = parseClockTime(model.clockOut) < parseClockTime(model.clockIn);
+    const clockInDay = recordDay ? new Date(recordDay.getTime() - (overnight ? 86400000 : 0)) : new Date();
+    const clockInAt = clockTimeOnDate(clockInDay, model.clockIn);
+
+    const breakError = await saveBreakList(
+      getRecordBreaks(record), model.breaks, clockInAt, model.clockIn,
+      { user_id: record.user_id, record_id: String(record.id) }
+    );
+    if (breakError) {
+      console.log('Failed to save breaks:', breakError);
+      return 'Could not save the breaks. Is supabase/breaks.sql run?';
+    }
+
+    const { error } = await supabase.from('records').update({
+      clock_in: model.clockIn,
+      clock_out: model.clockOut,
+      break_time: breakTime,
+      hours_worked: hoursWorked,
+      adjusted_by_admin: true
+    }).eq('id', record.id);
     if (error) {
       console.log('Failed to save edit:', error);
-      return;
+      return 'Could not save. Please try again.';
     }
-    cancelEdit();
     await loadData(true);
+    return '';
+  }
+
+  // Session still running (employee_status + its breaks).
+  // Their screen picks it up straight away through realtime.
+  async function saveLiveSession(employeeId, live, model) {
+    const clockInAt = clockTimeOnDate(new Date(live.clock_in_at), model.clockIn);
+    if (!clockInAt) return 'Pick a clock-in time.';
+    if (clockInAt > new Date()) return 'Clock-in time can\u2019t be in the future.';
+
+    const closed = model.breaks.filter(b => b.end !== null);
+    const open = model.breaks.find(b => b.end === null);
+    const breakSeconds = model.breaks.length > 0 ? sumBreakSeconds(closed) : hmsToSeconds(model.breakTotal);
+
+    const breakError = await saveBreakList(
+      getLiveBreaks(employeeId), model.breaks, clockInAt, model.clockIn, { user_id: employeeId }
+    );
+    if (breakError) {
+      console.log('Failed to save breaks:', breakError);
+      return 'Could not save the breaks. Is supabase/breaks.sql run?';
+    }
+
+    const update = {
+      clock_in_at: clockInAt.toISOString(),
+      break_accum_seconds: breakSeconds,
+      updated_at: new Date().toISOString()
+    };
+    if (open) update.break_started_at = breakTimestamps(open, clockInAt, model.clockIn).started_at;
+
+    const { error } = await supabase.from('employee_status').update(update).eq('user_id', employeeId);
+    if (error) return 'Could not save. Please try again.';
+    await refreshStatuses();
+    return '';
   }
 
   // Spinner on the refresh buttons, then "Updated" for a moment.
@@ -688,65 +791,6 @@ function AdminDashboard({ user, onLogout }) {
       if (dayDetailRef.current) dayDetailRef.current.scrollIntoView({ behavior: 'smooth', block: 'start' });
     });
   }, [timesheetSelectedDate]);
-
-  // ---------- Live session editing ----------
-  // Only clock-in time and finished breaks, clock out hasn't happened yet.
-  // Saved on employee_status, their timer picks it up on the next sync.
-
-  function startLiveEdit(live) {
-    setLiveEditError('');
-    setLiveEditForm({
-      clock_in: dateToHHMM(new Date(live.clock_in_at)),
-      break_time: secondsToHms(live.break_accum_seconds || 0)
-    });
-  }
-
-  // clock-in time on the same day as the original clock-in
-  function liveEditClockInDate(live, hhmm) {
-    const minutes = parseClockTime(hhmm);
-    if (minutes === null) return null;
-    const date = new Date(live.clock_in_at);
-    date.setHours(Math.floor(minutes / 60), minutes % 60, 0, 0);
-    return date;
-  }
-
-  function liveEditWorkedSeconds(live, form) {
-    const clockInAt = liveEditClockInDate(live, form.clock_in);
-    if (!clockInAt) return null;
-    return Math.max(0, Math.round((Date.now() - clockInAt) / 1000) - hmsToSeconds(form.break_time));
-  }
-
-  async function saveLiveEdit(employeeId, live) {
-    const clockInAt = liveEditClockInDate(live, liveEditForm.clock_in);
-    const breakSeconds = hmsToSeconds(liveEditForm.break_time);
-    if (!clockInAt) {
-      setLiveEditError('Pick a clock-in time.');
-      return;
-    }
-    if (clockInAt > new Date()) {
-      setLiveEditError('Clock-in time can\u2019t be in the future.');
-      return;
-    }
-    if (breakSeconds > (Date.now() - clockInAt) / 1000) {
-      setLiveEditError('Break time is longer than the session.');
-      return;
-    }
-
-    const { error } = await supabase
-      .from('employee_status')
-      .update({
-        clock_in_at: clockInAt.toISOString(),
-        break_accum_seconds: breakSeconds,
-        updated_at: new Date().toISOString()
-      })
-      .eq('user_id', employeeId);
-    if (error) {
-      setLiveEditError('Could not save. Please try again.');
-      return;
-    }
-    setLiveEditForm(null);
-    await refreshStatuses();
-  }
 
   // ---------- Unauthorised clock-ins: authorise / decline ----------
 
@@ -1809,10 +1853,20 @@ function AdminDashboard({ user, onLogout }) {
 
                 {(timesheetViewMode !== 'monthly' || timesheetSelectedDate) && (() => {
                   const activeDay = getActiveDate();
-                  const dayRecords = getRecordsForDay(timesheetEmployeeId, activeDay);
+                  const dayRecords = [...getRecordsForDay(timesheetEmployeeId, activeDay)]
+                    .sort((a, b) => (parseClockTime(a.clock_in) ?? 0) - (parseClockTime(b.clock_in) ?? 0));
                   const live = getLiveSession(timesheetEmployeeId);
                   const showLive = !!live && isSameDay(new Date(live.clock_in_at), activeDay);
                   const monthLocked = !!(timesheetApproval && timesheetApproval.approved);
+
+                  const workedSeconds = sumHoursSeconds(dayRecords) + (showLive ? getLiveWorkedSeconds(timesheetEmployeeId) : 0);
+                  const liveBreakSeconds = showLive
+                    ? (live.break_accum_seconds || 0) + (live.status === 'on_break' && live.break_started_at
+                      ? Math.max(0, (Date.now() - new Date(live.break_started_at).getTime()) / 1000) : 0)
+                    : 0;
+                  const breakSecondsTotal = dayRecords.filter(isCounted)
+                    .reduce((sum, r) => sum + hmsToSeconds(r.break_time), 0) + liveBreakSeconds;
+                  const sessionCount = dayRecords.length + (showLive ? 1 : 0);
 
                   return (
                     <div className="timesheet-day-detail" ref={dayDetailRef}>
@@ -1820,172 +1874,99 @@ function AdminDashboard({ user, onLogout }) {
                         {activeDay.toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })}
                       </h3>
 
-                      {/* Live session (still clocked in, not in records yet) */}
-                      {showLive && (
-                        <div className="timesheet-day-record">
-                          <div className="timesheet-day-record-grid">
-                            <div>
-                              <span className="timesheet-field-label">Clock In</span>
-                              {liveEditForm ? (
-                                <ClockTimePicker value={liveEditForm.clock_in} onChange={v => setLiveEditForm({ ...liveEditForm, clock_in: v })} />
-                              ) : (
-                                <p>
-                                  {formatClock(dateToHHMM(new Date(live.clock_in_at)))}
-                                  {live.location_status === 'unauthorised' && (
-                                    <span className="timesheet-record-flag" title="Unauthorised location" />
-                                  )}
-                                </p>
-                              )}
+                      {sessionCount === 0 ? (
+                        <p className="timesheet-day-empty">No session recorded this day.</p>
+                      ) : (
+                        <>
+                          <div className="day-summary">
+                            <div className="day-summary-item">
+                              <span className="timesheet-field-label">Worked</span>
+                              <strong>{formatDuration(workedSeconds)}</strong>
                             </div>
-                            <div>
-                              <span className="timesheet-field-label">Clock Out</span>
-                              <p>{live.status === 'on_break' ? 'On break' : 'In progress'}</p>
+                            <div className="day-summary-item">
+                              <span className="timesheet-field-label">Breaks</span>
+                              <strong>{formatDuration(breakSecondsTotal)}</strong>
                             </div>
-                            <div>
-                              <span className="timesheet-field-label">Break Time</span>
-                              {liveEditForm ? (
-                                <DurationPicker value={liveEditForm.break_time} onChange={v => setLiveEditForm({ ...liveEditForm, break_time: v })} />
-                              ) : (
-                                <p className="cell-warning">{secondsToHms(live.break_accum_seconds || 0)}</p>
-                              )}
+                            <div className="day-summary-item">
+                              <span className="timesheet-field-label">Sessions</span>
+                              <strong>{sessionCount}</strong>
                             </div>
-                            <div>
-                              <span className="timesheet-field-label">Hours Worked</span>
-                              <p className="cell-success">
-                                {(() => {
-                                  const worked = liveEditForm
-                                    ? liveEditWorkedSeconds(live, liveEditForm)
-                                    : liveEditWorkedSeconds(live, { clock_in: dateToHHMM(new Date(live.clock_in_at)), break_time: secondsToHms(live.break_accum_seconds || 0) });
-                                  return worked === null ? 'In progress' : `${secondsToHms(worked)} so far`;
-                                })()}
-                              </p>
-                            </div>
-                            <div>
-                              <span className="timesheet-field-label">Location</span>
-                              <div className="location-cell">
+                          </div>
+
+                          {dayRecords.map((record, i) => {
+                            const needsReview = record.location_status === 'unauthorised';
+                            const isDeclined = record.location_status === 'declined';
+                            const savingLocation = locationSavingId === record.id;
+                            return (
+                              <div className="day-session" key={record.id}>
+                                <div className="day-session-head">
+                                  <span className="day-session-title">Session {i + 1}</span>
+                                  <span className={`location-tag location-tag-${record.location_status || 'unavailable'}`}>
+                                    {locationLabel(record.location_status)}
+                                  </span>
+                                  {needsReview && <span className="timesheet-record-flag" title="Unauthorised location" />}
+                                  {record.adjusted_by_admin && <span className="record-adjusted-tag">Adjusted by admin</span>}
+                                  <span className="day-session-actions">
+                                    {monthLocked ? (
+                                      <span className="admin-link-muted">Month approved {'\u2014'} reopen to edit</span>
+                                    ) : (
+                                      <>
+                                        {(needsReview || isDeclined) && (
+                                          <button className="admin-link-btn" disabled={savingLocation} onClick={() => setRecordLocationStatus(record.id, 'authorised')}>Authorise</button>
+                                        )}
+                                        {needsReview && (
+                                          <button className="admin-link-btn admin-link-danger" disabled={savingLocation} onClick={() => setRecordLocationStatus(record.id, 'declined')}>Decline</button>
+                                        )}
+                                      </>
+                                    )}
+                                  </span>
+                                </div>
+                                <SessionTimeline
+                                  session={recordToSession(record)}
+                                  editable={!monthLocked}
+                                  onSave={model => saveRecordSession(record, model)}
+                                />
+                              </div>
+                            );
+                          })}
+
+                          {showLive && (
+                            <div className="day-session">
+                              <div className="day-session-head">
+                                <span className="day-session-title">
+                                  Session {dayRecords.length + 1} {'\u00b7'} {live.status === 'on_break' ? 'On break' : 'In progress'}
+                                </span>
                                 <span className={`location-tag location-tag-${live.location_status || 'unavailable'}`}>
                                   {locationLabel(live.location_status)}
                                 </span>
-                              </div>
-                            </div>
-                          </div>
-                          {liveEditError && liveEditForm && <p className="admin-confirm-error">{liveEditError}</p>}
-                          <div className="timesheet-day-record-actions">
-                            {liveEditForm ? (
-                              <>
-                                <button className="admin-link-btn" onClick={() => saveLiveEdit(timesheetEmployeeId, live)}>Save</button>
-                                <button className="admin-link-btn admin-link-muted" onClick={() => setLiveEditForm(null)}>Cancel</button>
-                              </>
-                            ) : (
-                              <>
-                                {(live.location_status === 'unauthorised' || live.location_status === 'declined') && (
-                                  <button
-                                    className="admin-link-btn"
-                                    disabled={locationSavingId === `live-${timesheetEmployeeId}`}
-                                    onClick={() => setLiveLocationStatus(timesheetEmployeeId, 'authorised')}>
-                                    Authorise
-                                  </button>
-                                )}
-                                {live.location_status === 'unauthorised' && (
-                                  <button
-                                    className="admin-link-btn admin-link-danger"
-                                    disabled={locationSavingId === `live-${timesheetEmployeeId}`}
-                                    onClick={() => setLiveLocationStatus(timesheetEmployeeId, 'declined')}>
-                                    Decline
-                                  </button>
-                                )}
-                                <button className="admin-link-btn" onClick={() => startLiveEdit(live)}>Edit</button>
-                              </>
-                            )}
-                          </div>
-                        </div>
-                      )}
-
-                      {dayRecords.length === 0 && !showLive ? (
-                        <p className="timesheet-day-empty">No session recorded this day.</p>
-                      ) : (
-                        dayRecords.map(record => {
-                          const isEditing = editingRecordId === record.id;
-                          const needsReview = record.location_status === 'unauthorised';
-                          const isDeclined = record.location_status === 'declined';
-                          const savingLocation = locationSavingId === record.id;
-                          return (
-                            <div className="timesheet-day-record" key={record.id}>
-                              <div className="timesheet-day-record-grid">
-                                <div>
-                                  <span className="timesheet-field-label">Clock In</span>
-                                  {isEditing ? (
-                                    <ClockTimePicker value={editForm.clock_in} onChange={v => updateEditField('clock_in', v)} />
-                                  ) : (
-                                    <p>
-                                      {formatClock(record.clock_in)}
-                                      {needsReview && <span className="timesheet-record-flag" title="Unauthorised location" />}
-                                    </p>
+                                {live.location_status === 'unauthorised' && <span className="timesheet-record-flag" title="Unauthorised location" />}
+                                <span className="day-session-actions">
+                                  {(live.location_status === 'unauthorised' || live.location_status === 'declined') && (
+                                    <button
+                                      className="admin-link-btn"
+                                      disabled={locationSavingId === `live-${timesheetEmployeeId}`}
+                                      onClick={() => setLiveLocationStatus(timesheetEmployeeId, 'authorised')}>
+                                      Authorise
+                                    </button>
                                   )}
-                                </div>
-                                <div>
-                                  <span className="timesheet-field-label">Clock Out</span>
-                                  {isEditing ? (
-                                    <ClockTimePicker value={editForm.clock_out} onChange={v => updateEditField('clock_out', v)} />
-                                  ) : <p>{formatClock(record.clock_out)}</p>}
-                                </div>
-                                <div>
-                                  <span className="timesheet-field-label">Break Time</span>
-                                  {isEditing ? (
-                                    <DurationPicker value={editForm.break_time} onChange={v => updateEditField('break_time', v)} />
-                                  ) : <p className="cell-warning">{record.break_time}</p>}
-                                </div>
-                                <div>
-                                  <span className="timesheet-field-label">Hours Worked</span>
-                                  {isEditing ? (
-                                    <DurationPicker value={editForm.hours_worked} onChange={v => updateEditField('hours_worked', v)} />
-                                  ) : <p className={isDeclined ? 'cell-declined' : 'cell-success'}>{record.hours_worked}</p>}
-                                </div>
-                                <div>
-                                  <span className="timesheet-field-label">Location</span>
-                                  <div className="location-cell">
-                                    <span className={`location-tag location-tag-${record.location_status || 'unavailable'}`}>
-                                      {locationLabel(record.location_status)}
-                                    </span>
-                                  </div>
-                                </div>
+                                  {live.location_status === 'unauthorised' && (
+                                    <button
+                                      className="admin-link-btn admin-link-danger"
+                                      disabled={locationSavingId === `live-${timesheetEmployeeId}`}
+                                      onClick={() => setLiveLocationStatus(timesheetEmployeeId, 'declined')}>
+                                      Decline
+                                    </button>
+                                  )}
+                                </span>
                               </div>
-                              <div className="timesheet-day-record-actions">
-                                {record.adjusted_by_admin && !isEditing && (
-                                  <span className="record-adjusted-tag">Adjusted by admin</span>
-                                )}
-                                {isEditing ? (
-                                  <>
-                                    <button className="admin-link-btn" onClick={() => saveEdit(record.id)}>Save</button>
-                                    <button className="admin-link-btn admin-link-muted" onClick={cancelEdit}>Cancel</button>
-                                  </>
-                                ) : monthLocked ? (
-                                  <span className="admin-link-muted">Month approved — reopen to edit</span>
-                                ) : (
-                                  <>
-                                    {(needsReview || isDeclined) && (
-                                      <button
-                                        className="admin-link-btn"
-                                        disabled={savingLocation}
-                                        onClick={() => setRecordLocationStatus(record.id, 'authorised')}>
-                                        Authorise
-                                      </button>
-                                    )}
-                                    {needsReview && (
-                                      <button
-                                        className="admin-link-btn admin-link-danger"
-                                        disabled={savingLocation}
-                                        onClick={() => setRecordLocationStatus(record.id, 'declined')}>
-                                        Decline
-                                      </button>
-                                    )}
-                                    <button className="admin-link-btn" onClick={() => startEdit(record)}>Edit</button>
-                                  </>
-                                )}
-                              </div>
+                              <SessionTimeline
+                                session={liveToSession(live, timesheetEmployeeId)}
+                                editable
+                                onSave={model => saveLiveSession(timesheetEmployeeId, live, model)}
+                              />
                             </div>
-                          );
-                        })
+                          )}
+                        </>
                       )}
                     </div>
                   );
