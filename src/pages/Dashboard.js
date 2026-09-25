@@ -100,6 +100,8 @@ function Dashboard({ user, onLogout }) {
   // Stops a double-click on Clock Out saving the session twice.
   const clockOutInProgressRef = useRef(false);
   const [breakSeconds, setBreakSeconds] = useState(0);
+  // finished breaks this session (breakSeconds is only the current break)
+  const [breakAccumSeconds, setBreakAccumSeconds] = useState(0);
   const [reminder, setReminder] = useState('');
   const [clockInTime, setClockInTime] = useState(null);
   const [records, setRecords] = useState([]);
@@ -245,6 +247,7 @@ function Dashboard({ user, onLogout }) {
       setIsOnBreak(false);
       setSeconds(0);
       setBreakSeconds(0);
+      setBreakAccumSeconds(0);
       applyLocationStatus(null);
       // Next clock-in counts as a new session so the reminder flags reset.
       lastRemindersResetForRef.current = null;
@@ -267,7 +270,8 @@ function Dashboard({ user, onLogout }) {
     }
 
     setIsClockedIn(true);
-    setClockInTime(new Date(clockInAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
+    setClockInTime(dateToHHMM(new Date(clockInAt)));
+    setBreakAccumSeconds(breakAccum);
     applyLocationStatus(status.location_status || null);
 
     if (status.status === 'on_break' && status.break_started_at) {
@@ -477,14 +481,22 @@ function Dashboard({ user, onLogout }) {
   async function saveRecord() {
     // Location from employee_status first (survives a refresh and holds the
     // admin's authorise/decline), local state as fallback.
+    // Hours and break from the server's clock_in_at + break total, so an
+    // admin edit to a live session is picked up and the local timer isn't trusted.
     const serverStatus = await readEmployeeStatus();
+    const now = new Date();
+    const clockInAt = serverStatus?.clock_in_at ? new Date(serverStatus.clock_in_at) : null;
+    const breakTotal = clockInAt ? (serverStatus.break_accum_seconds || 0) : breakAccumSeconds;
+    const workedSeconds = clockInAt
+      ? Math.max(0, Math.round((now - clockInAt) / 1000) - breakTotal)
+      : seconds;
     const newRecord = {
       user_id: user.id,
-      date: new Date().toLocaleDateString('en-GB'),
-      clock_in: serverStatus?.clock_in_at ? dateToHHMM(new Date(serverStatus.clock_in_at)) : clockInTime,
-      clock_out: dateToHHMM(new Date()),
-      hours_worked: formatTime(seconds),
-      break_time: formatTime(breakSeconds),
+      date: now.toLocaleDateString('en-GB'),
+      clock_in: clockInAt ? dateToHHMM(clockInAt) : clockInTime,
+      clock_out: dateToHHMM(now),
+      hours_worked: formatTime(workedSeconds),
+      break_time: formatTime(breakTotal),
       location_status: serverStatus?.location_status || locationStatus || 'unavailable'
     };
 
@@ -552,7 +564,8 @@ function Dashboard({ user, onLogout }) {
     setIsOnBreak(false);
     setSeconds(0);
     setBreakSeconds(0);
-    setClockInTime(getCurrentTime());
+    setClockInTime(dateToHHMM(new Date()));
+    setBreakAccumSeconds(0);
     requestNotificationPermission();
     // New session, reset the reminder flags.
     remindersFiredRef.current = {
@@ -617,11 +630,13 @@ function Dashboard({ user, onLogout }) {
       setReminder('Break ended. Welcome back.');
 
       const current = await readEmployeeStatus();
+      const newAccum = (current.break_accum_seconds || 0) + breakSeconds;
+      setBreakAccumSeconds(newAccum);
       await syncEmployeeStatus({
         ...current,
         status: 'clocked_in',
         break_started_at: null,
-        break_accum_seconds: (current.break_accum_seconds || 0) + breakSeconds
+        break_accum_seconds: newAccum
       });
     }
   }
@@ -783,17 +798,40 @@ function Dashboard({ user, onLogout }) {
     if (mode !== 'all' && !timesheetSelectedDate) setTimesheetSelectedDate(new Date());
   }
 
+  // Session still running: counted as today everywhere, same as Activities
+  function getLiveBreakSeconds() {
+    return breakAccumSeconds + (isOnBreak ? breakSeconds : 0);
+  }
+
+  function liveSessionIn(start, end) {
+    if (!isClockedIn) return false;
+    const today = new Date();
+    return today >= start && today <= end;
+  }
+
   function getTimesheetPeriodTotal() {
-    if (timesheetViewMode === 'daily') return sumRecordsSeconds(getRecordsForDay(getActiveTimesheetDate()));
-    if (timesheetViewMode === 'weekly') {
-      const [start, end] = getCalendarWeekRange(getActiveTimesheetDate());
-      return sumRecordsSeconds(records.filter(r => {
+    const active = getActiveTimesheetDate();
+    let total;
+    let start;
+    let end;
+    if (timesheetViewMode === 'daily') {
+      total = sumRecordsSeconds(getRecordsForDay(active));
+      start = new Date(active); start.setHours(0, 0, 0, 0);
+      end = new Date(active); end.setHours(23, 59, 59, 999);
+    } else if (timesheetViewMode === 'weekly') {
+      [start, end] = getCalendarWeekRange(active);
+      total = sumRecordsSeconds(records.filter(r => {
         const d = parseRecordDate(r.date);
         return d && d >= start && d <= end;
       }));
+    } else if (timesheetViewMode === 'monthly') {
+      total = sumRecordsSeconds(getRecordsForCalendarMonth(timesheetMonthDate));
+      start = new Date(timesheetMonthDate.getFullYear(), timesheetMonthDate.getMonth(), 1);
+      end = new Date(timesheetMonthDate.getFullYear(), timesheetMonthDate.getMonth() + 1, 0, 23, 59, 59, 999);
+    } else {
+      return sumRecordsSeconds(filteredRecords()) + (isClockedIn ? seconds : 0);
     }
-    if (timesheetViewMode === 'monthly') return sumRecordsSeconds(getRecordsForCalendarMonth(timesheetMonthDate));
-    return sumRecordsSeconds(filteredRecords());
+    return total + (liveSessionIn(start, end) ? seconds : 0);
   }
 
   // Activities card. Daily = sessions finished today + the one running now.
@@ -810,7 +848,7 @@ function Dashboard({ user, onLogout }) {
 
       return {
         workedSeconds: completedWorked + seconds,
-        breakSecondsVal: completedBreak + breakSeconds,
+        breakSecondsVal: completedBreak + (isClockedIn ? getLiveBreakSeconds() : 0),
         targetSeconds: 28800,
         sessions: todayRecs.length + (isClockedIn ? 1 : 0),
         label: "Today's Summary"
@@ -827,10 +865,10 @@ function Dashboard({ user, onLogout }) {
     });
 
     return {
-      workedSeconds: workedSecondsVal,
-      breakSecondsVal,
+      workedSeconds: workedSecondsVal + (isClockedIn ? seconds : 0),
+      breakSecondsVal: breakSecondsVal + (isClockedIn ? getLiveBreakSeconds() : 0),
       targetSeconds: activitiesFilter === 'weekly' ? 40 * 3600 : 160 * 3600,
-      sessions: recs.length,
+      sessions: recs.length + (isClockedIn ? 1 : 0),
       label: activitiesFilter === 'weekly' ? "This Week's Summary" : "This Month's Summary"
     };
   }
@@ -1510,8 +1548,40 @@ function Dashboard({ user, onLogout }) {
                 <h3>
                   {getActiveTimesheetDate().toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })}
                 </h3>
+                {isClockedIn && isSameCalendarDay(getActiveTimesheetDate(), new Date()) && (
+                  <div className="timesheet-day-record">
+                    <div className="timesheet-day-record-grid">
+                      <div>
+                        <span className="timesheet-field-label">Clock In</span>
+                        <p>{formatClock(clockInTime)}</p>
+                      </div>
+                      <div>
+                        <span className="timesheet-field-label">Clock Out</span>
+                        <p>{isOnBreak ? 'On break' : 'In progress'}</p>
+                      </div>
+                      <div>
+                        <span className="timesheet-field-label">Break Time</span>
+                        <p className="cell-warning">{formatTime(getLiveBreakSeconds())}</p>
+                      </div>
+                      <div>
+                        <span className="timesheet-field-label">Hours Worked</span>
+                        <p className="cell-success">{formatTime(seconds)}</p>
+                      </div>
+                      <div>
+                        <span className="timesheet-field-label">Location</span>
+                        <p>
+                          <span className={`location-tag location-tag-${locationStatus || 'unavailable'}`}>
+                            {locationLabel(locationStatus)}
+                          </span>
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+                )}
                 {getRecordsForDay(getActiveTimesheetDate()).length === 0 ? (
-                  <p className="timesheet-day-empty">No session recorded this day.</p>
+                  !(isClockedIn && isSameCalendarDay(getActiveTimesheetDate(), new Date())) && (
+                    <p className="timesheet-day-empty">No session recorded this day.</p>
+                  )
                 ) : (
                   getRecordsForDay(getActiveTimesheetDate()).map((record, i) => (
                     <div className="timesheet-day-record" key={record.id || i}>

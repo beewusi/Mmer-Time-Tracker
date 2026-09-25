@@ -113,6 +113,8 @@ function AdminDashboard({ user, onLogout }) {
   const [isNavOpen, setIsNavOpen] = useState(false);
   const [locationSavingId, setLocationSavingId] = useState(null);
   const [refreshState, setRefreshState] = useState('idle');
+  const [liveEditForm, setLiveEditForm] = useState(null);
+  const [liveEditError, setLiveEditError] = useState('');
   const dayDetailRef = useRef(null);
   const scrollToDetailRef = useRef(false);
 
@@ -129,6 +131,10 @@ function AdminDashboard({ user, onLogout }) {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [employees]);
+
+  useEffect(() => {
+    setLiveEditForm(null);
+  }, [timesheetEmployeeId]);
 
   useEffect(() => {
     if (timesheetEmployeeId) {
@@ -300,24 +306,31 @@ function AdminDashboard({ user, onLogout }) {
     );
   }
 
+  // Worked so far in a session that's still running (0 if not clocked in)
+  function getLiveWorkedSeconds(userId) {
+    const st = employeeStatuses[userId];
+    if (!st || !st.clock_in_at || (st.status !== 'clocked_in' && st.status !== 'on_break')) return 0;
+    const now = Date.now();
+    const currentBreak = st.status === 'on_break' && st.break_started_at
+      ? (now - new Date(st.break_started_at).getTime()) / 1000
+      : 0;
+    return Math.max(0, Math.round((now - new Date(st.clock_in_at).getTime()) / 1000 - (st.break_accum_seconds || 0) - currentBreak));
+  }
+
+  function isLiveToday(userId) {
+    const st = employeeStatuses[userId];
+    return !!st && !!st.clock_in_at && (st.status === 'clocked_in' || st.status === 'on_break')
+      && new Date(st.clock_in_at).toDateString() === new Date().toDateString();
+  }
+
+  // Finished sessions today + the one still running
   function getTotalHoursToday(userId) {
-    const todayRecords = getTodayRecords(userId).filter(isCounted);
-    if (todayRecords.length === 0) return '00:00:00';
+    const finished = sumHoursSeconds(getTodayRecords(userId));
+    return secondsToHms(finished + (isLiveToday(userId) ? getLiveWorkedSeconds(userId) : 0));
+  }
 
-    let totalSeconds = 0;
-    todayRecords.forEach(record => {
-      if (record.hours_worked) {
-        const parts = record.hours_worked.split(':');
-        totalSeconds += parseInt(parts[0]) * 3600 +
-          parseInt(parts[1]) * 60 +
-          parseInt(parts[2]);
-      }
-    });
-
-    const h = Math.floor(totalSeconds / 3600);
-    const m = Math.floor((totalSeconds % 3600) / 60);
-    const s = totalSeconds % 60;
-    return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+  function getSessionsToday(userId) {
+    return getTodayRecords(userId).length + (isLiveToday(userId) ? 1 : 0);
   }
 
   function isOnLeaveToday(userId) {
@@ -710,6 +723,65 @@ function AdminDashboard({ user, onLogout }) {
     });
   }, [timesheetSelectedDate]);
 
+  // ---------- Live session editing ----------
+  // Only clock-in time and finished breaks, clock out hasn't happened yet.
+  // Saved on employee_status, their timer picks it up on the next sync.
+
+  function startLiveEdit(live) {
+    setLiveEditError('');
+    setLiveEditForm({
+      clock_in: dateToHHMM(new Date(live.clock_in_at)),
+      break_time: secondsToHms(live.break_accum_seconds || 0)
+    });
+  }
+
+  // clock-in time on the same day as the original clock-in
+  function liveEditClockInDate(live, hhmm) {
+    const minutes = parseClockTime(hhmm);
+    if (minutes === null) return null;
+    const date = new Date(live.clock_in_at);
+    date.setHours(Math.floor(minutes / 60), minutes % 60, 0, 0);
+    return date;
+  }
+
+  function liveEditWorkedSeconds(live, form) {
+    const clockInAt = liveEditClockInDate(live, form.clock_in);
+    if (!clockInAt) return null;
+    return Math.max(0, Math.round((Date.now() - clockInAt) / 1000) - hmsToSeconds(form.break_time));
+  }
+
+  async function saveLiveEdit(employeeId, live) {
+    const clockInAt = liveEditClockInDate(live, liveEditForm.clock_in);
+    const breakSeconds = hmsToSeconds(liveEditForm.break_time);
+    if (!clockInAt) {
+      setLiveEditError('Pick a clock-in time.');
+      return;
+    }
+    if (clockInAt > new Date()) {
+      setLiveEditError('Clock-in time can\u2019t be in the future.');
+      return;
+    }
+    if (breakSeconds > (Date.now() - clockInAt) / 1000) {
+      setLiveEditError('Break time is longer than the session.');
+      return;
+    }
+
+    const { error } = await supabase
+      .from('employee_status')
+      .update({
+        clock_in_at: clockInAt.toISOString(),
+        break_accum_seconds: breakSeconds,
+        updated_at: new Date().toISOString()
+      })
+      .eq('user_id', employeeId);
+    if (error) {
+      setLiveEditError('Could not save. Please try again.');
+      return;
+    }
+    setLiveEditForm(null);
+    await refreshStatuses();
+  }
+
   // ---------- Unauthorised clock-ins: authorise / decline ----------
 
   // For a finished session (a row in records).
@@ -902,16 +974,31 @@ function AdminDashboard({ user, onLogout }) {
     setApprovalSaving(false);
   }
 
+  // Running session counted in whichever period its clock-in falls in
+  function withLiveSession(stats, start, end) {
+    const live = getLiveSession(timesheetEmployeeId);
+    if (!live) return stats;
+    const clockInAt = new Date(live.clock_in_at);
+    if (clockInAt < start || clockInAt > end) return stats;
+    return {
+      ...stats,
+      seconds: stats.seconds + getLiveWorkedSeconds(timesheetEmployeeId),
+      count: stats.count + 1
+    };
+  }
+
   function getTimesheetStats() {
     const anchor = getActiveDate();
 
     if (timesheetViewMode === 'daily') {
       const recs = getRecordsForDay(timesheetEmployeeId, anchor);
-      return {
+      const start = new Date(anchor); start.setHours(0, 0, 0, 0);
+      const end = new Date(anchor); end.setHours(23, 59, 59, 999);
+      return withLiveSession({
         seconds: sumHoursSeconds(recs),
         label: anchor.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }),
         count: recs.length
-      };
+      }, start, end);
     }
 
     if (timesheetViewMode === 'weekly') {
@@ -921,19 +1008,21 @@ function AdminDashboard({ user, onLogout }) {
         const d = parseRecordDate(r.date);
         return d && d >= start && d <= end;
       });
-      return {
+      return withLiveSession({
         seconds: sumHoursSeconds(recs),
         label: `Week of ${start.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' })}`,
         count: recs.length
-      };
+      }, start, end);
     }
 
     const recs = getRecordsForMonth(timesheetEmployeeId, timesheetMonthDate);
-    return {
+    const start = new Date(timesheetMonthDate.getFullYear(), timesheetMonthDate.getMonth(), 1);
+    const end = new Date(timesheetMonthDate.getFullYear(), timesheetMonthDate.getMonth() + 1, 0, 23, 59, 59, 999);
+    return withLiveSession({
       seconds: sumHoursSeconds(recs),
       label: timesheetMonthDate.toLocaleDateString('en-GB', { month: 'long', year: 'numeric' }),
       count: recs.length
-    };
+    }, start, end);
   }
 
   async function toggleLocationAlerts() {
@@ -1593,7 +1682,7 @@ function AdminDashboard({ user, onLogout }) {
                           <td className="cell-success">
                             {getTotalHoursToday(employee.id)}
                           </td>
-                          <td>{getTodayRecords(employee.id).length}</td>
+                          <td>{getSessionsToday(employee.id)}</td>
                         </tr>
                       );
                     })}
@@ -1770,12 +1859,16 @@ function AdminDashboard({ user, onLogout }) {
                           <div className="timesheet-day-record-grid">
                             <div>
                               <span className="timesheet-field-label">Clock In</span>
-                              <p>
-                                {formatClock(dateToHHMM(new Date(live.clock_in_at)))}
-                                {live.location_status === 'unauthorised' && (
-                                  <span className="timesheet-record-flag" title="Unauthorised location" />
-                                )}
-                              </p>
+                              {liveEditForm ? (
+                                <ClockTimePicker value={liveEditForm.clock_in} onChange={v => setLiveEditForm({ ...liveEditForm, clock_in: v })} />
+                              ) : (
+                                <p>
+                                  {formatClock(dateToHHMM(new Date(live.clock_in_at)))}
+                                  {live.location_status === 'unauthorised' && (
+                                    <span className="timesheet-record-flag" title="Unauthorised location" />
+                                  )}
+                                </p>
+                              )}
                             </div>
                             <div>
                               <span className="timesheet-field-label">Clock Out</span>
@@ -1783,11 +1876,22 @@ function AdminDashboard({ user, onLogout }) {
                             </div>
                             <div>
                               <span className="timesheet-field-label">Break Time</span>
-                              <p className="cell-warning">{secondsToHms(live.break_accum_seconds || 0)}</p>
+                              {liveEditForm ? (
+                                <input className="admin-edit-input" value={liveEditForm.break_time} placeholder="HH:MM:SS" onChange={e => setLiveEditForm({ ...liveEditForm, break_time: e.target.value })} />
+                              ) : (
+                                <p className="cell-warning">{secondsToHms(live.break_accum_seconds || 0)}</p>
+                              )}
                             </div>
                             <div>
                               <span className="timesheet-field-label">Hours Worked</span>
-                              <p className="cell-success">In progress</p>
+                              <p className="cell-success">
+                                {(() => {
+                                  const worked = liveEditForm
+                                    ? liveEditWorkedSeconds(live, liveEditForm)
+                                    : liveEditWorkedSeconds(live, { clock_in: dateToHHMM(new Date(live.clock_in_at)), break_time: secondsToHms(live.break_accum_seconds || 0) });
+                                  return worked === null ? 'In progress' : `${secondsToHms(worked)} so far`;
+                                })()}
+                              </p>
                             </div>
                             <div>
                               <span className="timesheet-field-label">Location</span>
@@ -1798,24 +1902,35 @@ function AdminDashboard({ user, onLogout }) {
                               </div>
                             </div>
                           </div>
-                          {(live.location_status === 'unauthorised' || live.location_status === 'declined') && (
-                            <div className="timesheet-day-record-actions">
-                              <button
-                                className="admin-link-btn"
-                                disabled={locationSavingId === `live-${timesheetEmployeeId}`}
-                                onClick={() => setLiveLocationStatus(timesheetEmployeeId, 'authorised')}>
-                                Authorise
-                              </button>
-                              {live.location_status === 'unauthorised' && (
-                                <button
-                                  className="admin-link-btn admin-link-danger"
-                                  disabled={locationSavingId === `live-${timesheetEmployeeId}`}
-                                  onClick={() => setLiveLocationStatus(timesheetEmployeeId, 'declined')}>
-                                  Decline
-                                </button>
-                              )}
-                            </div>
-                          )}
+                          {liveEditError && liveEditForm && <p className="admin-confirm-error">{liveEditError}</p>}
+                          <div className="timesheet-day-record-actions">
+                            {liveEditForm ? (
+                              <>
+                                <button className="admin-link-btn" onClick={() => saveLiveEdit(timesheetEmployeeId, live)}>Save</button>
+                                <button className="admin-link-btn admin-link-muted" onClick={() => setLiveEditForm(null)}>Cancel</button>
+                              </>
+                            ) : (
+                              <>
+                                {(live.location_status === 'unauthorised' || live.location_status === 'declined') && (
+                                  <button
+                                    className="admin-link-btn"
+                                    disabled={locationSavingId === `live-${timesheetEmployeeId}`}
+                                    onClick={() => setLiveLocationStatus(timesheetEmployeeId, 'authorised')}>
+                                    Authorise
+                                  </button>
+                                )}
+                                {live.location_status === 'unauthorised' && (
+                                  <button
+                                    className="admin-link-btn admin-link-danger"
+                                    disabled={locationSavingId === `live-${timesheetEmployeeId}`}
+                                    onClick={() => setLiveLocationStatus(timesheetEmployeeId, 'declined')}>
+                                    Decline
+                                  </button>
+                                )}
+                                <button className="admin-link-btn" onClick={() => startLiveEdit(live)}>Edit</button>
+                              </>
+                            )}
+                          </div>
                         </div>
                       )}
 
