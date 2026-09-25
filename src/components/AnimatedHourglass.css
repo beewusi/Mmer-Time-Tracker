@@ -1,0 +1,59 @@
+.hg {
+  color: var(--white);
+  overflow: visible;
+  flex-shrink: 0;
+}
+
+.hg-sand {
+  fill: #FBBF24; /* warm sand tone, decorative only */
+}
+
+.hg-sand-top {
+  transform-box: fill-box;
+  transform-origin: bottom center;
+  animation: hg-drain 4.5s linear infinite;
+}
+
+.hg-sand-bottom {
+  transform-box: fill-box;
+  transform-origin: bottom center;
+  animation: hg-fill 4.5s linear infinite;
+}
+
+.hg-grain {
+  fill: #FBBF24;
+  opacity: 0;
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: hg-fall 1s linear infinite;
+}
+
+.hg-grain-2 { animation-delay: 0.33s; }
+.hg-grain-3 { animation-delay: 0.66s; }
+
+@keyframes hg-drain {
+  0%   { transform: scaleY(1); }
+  92%  { transform: scaleY(0.02); }
+  100% { transform: scaleY(0.02); }
+}
+
+@keyframes hg-fill {
+  0%   { transform: scaleY(0.02); }
+  92%  { transform: scaleY(1); }
+  100% { transform: scaleY(1); }
+}
+
+@keyframes hg-fall {
+  0%   { transform: translateY(0); opacity: 0; }
+  15%  { opacity: 1; }
+  85%  { opacity: 1; }
+  100% { transform: translateY(11px); opacity: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .hg-sand-top, .hg-sand-bottom, .hg-grain {
+    animation: none;
+  }
+  .hg-sand-top { transform: scaleY(0.5); }
+  .hg-sand-bottom { transform: scaleY(0.5); }
+}

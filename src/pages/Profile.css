@@ -1,0 +1,276 @@
+.profile-page {
+  padding: var(--space-5) var(--space-6);
+  max-width: 900px;
+  margin: 0 auto;
+}
+
+.profile-header {
+  margin-bottom: var(--space-4);
+}
+
+.back-btn {
+  background: none;
+  border: none;
+  color: var(--blue);
+  font-size: 13.5px;
+  font-weight: 600;
+  cursor: pointer;
+  padding: 0;
+  margin-bottom: var(--space-2);
+}
+
+.back-btn:hover {
+  text-decoration: underline;
+}
+
+.profile-header h1 {
+  font-family: var(--font-display);
+  font-size: 24px;
+  font-weight: 600;
+  color: var(--navy);
+  margin: 0;
+}
+
+.profile-content {
+  display: grid;
+  grid-template-columns: 280px 1fr;
+  gap: var(--space-3);
+  align-items: start;
+}
+
+.avatar-card {
+  background: #FFFFFF;
+  border: var(--border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-card);
+  padding: var(--space-4);
+  text-align: center;
+}
+
+.profile-avatar-wrap {
+  position: relative;
+  width: 72px;
+  margin: 0 auto var(--space-3);
+}
+
+.profile-avatar {
+  width: 72px;
+  height: 72px;
+  border-radius: 50%;
+  background: var(--navy);
+  color: var(--white);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 26px;
+  font-weight: 600;
+}
+
+.profile-avatar-img {
+  object-fit: cover;
+}
+
+.avatar-edit-btn {
+  position: absolute;
+  bottom: -2px;
+  right: -2px;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  background: var(--blue);
+  color: #FFFFFF;
+  border: 2px solid #FFFFFF;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.avatar-edit-btn:hover {
+  background: var(--blue-700);
+}
+
+.avatar-file-input {
+  display: none;
+}
+
+.avatar-error {
+  color: var(--danger);
+  font-size: 12px;
+  margin: 0 0 var(--space-2);
+}
+
+.avatar-card h2 {
+  font-size: 17px;
+  font-weight: 600;
+  color: var(--navy);
+  margin: 0 0 4px;
+}
+
+.profile-email {
+  font-size: 13px;
+  color: var(--gray-500);
+  margin: 0 0 4px;
+}
+
+.profile-dept {
+  font-size: 12.5px;
+  color: var(--blue);
+  font-weight: 600;
+  margin: 0;
+}
+
+.profile-form-card {
+  background: #FFFFFF;
+  border: var(--border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-card);
+  padding: var(--space-4);
+}
+
+.profile-form-card h3 {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--navy);
+  margin: 0 0 var(--space-3);
+}
+
+.form-alert {
+  background-color: var(--danger-bg);
+  color: var(--danger);
+  padding: 10px 14px;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  margin-bottom: var(--space-3);
+}
+
+.form-success {
+  background-color: var(--success-bg);
+  color: var(--success);
+  padding: 10px 14px;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  margin-bottom: var(--space-3);
+}
+
+.input-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: var(--space-3);
+}
+
+.input-group label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--navy-700);
+}
+
+.input-group input {
+  padding: 11px 14px;
+  border: 1px solid var(--gray-300);
+  border-radius: var(--radius-sm);
+  font-size: 14px;
+  color: var(--navy);
+  background: #FFFFFF;
+}
+
+.input-group input:focus {
+  border-color: var(--blue);
+  outline: none;
+}
+
+.input-disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.input-note {
+  font-size: 11.5px;
+  color: var(--gray-400);
+  margin: -2px 0 0;
+}
+
+.save-btn {
+  padding: 12px 20px;
+  background: var(--blue);
+  color: #FFFFFF;
+  border: none;
+  border-radius: var(--radius-sm);
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.save-btn:hover:not(:disabled) {
+  background: var(--blue-700);
+}
+
+.save-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* ---------- Dark mode ---------- */
+/* Card surfaces get a step up from the page background instead of
+   staying stark white, so the contrast reads as intentional, not harsh. */
+.profile-page.dark {
+  background: var(--navy);
+  min-height: 100%;
+}
+
+.profile-page.dark .profile-header h1 {
+  color: var(--white);
+}
+
+.profile-page.dark .avatar-card,
+.profile-page.dark .profile-form-card {
+  background: var(--navy-700);
+  border-color: rgba(248, 250, 252, 0.1);
+}
+
+.profile-page.dark .avatar-card h2,
+.profile-page.dark .profile-form-card h3 {
+  color: var(--white);
+}
+
+.profile-page.dark .profile-email {
+  color: var(--gray-300);
+}
+
+.profile-page.dark .avatar-edit-btn {
+  border-color: var(--navy-700);
+}
+
+.profile-page.dark .input-group label {
+  color: var(--gray-200);
+}
+
+.profile-page.dark .input-group input {
+  background: rgba(248, 250, 252, 0.06);
+  border-color: rgba(248, 250, 252, 0.15);
+  color: var(--white);
+}
+
+.profile-page.dark .input-group input::placeholder {
+  color: var(--gray-400);
+}
+
+.profile-page.dark .input-disabled {
+  background: rgba(248, 250, 252, 0.03);
+  color: var(--gray-400);
+}
+
+.profile-page.dark .input-note {
+  color: var(--gray-400);
+}
+
+@media (max-width: 760px) {
+  .profile-content {
+    grid-template-columns: 1fr;
+  }
+  .profile-page {
+    padding: var(--space-4);
+  }
+}

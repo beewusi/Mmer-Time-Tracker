@@ -1,0 +1,1853 @@
+import { useState, useEffect, useRef } from 'react';
+import emailjs from '@emailjs/browser';
+import { supabase } from '../supabase';
+import {
+  TEST_MODE, getRecords, addRecord,
+  getTimeOffRequests, addTimeOffRequest, cancelTimeOffRequest,
+  getPublicHolidays, getAvatar,
+  getEmployeeStatus, setEmployeeStatus
+} from '../mockData';
+import { callAI } from '../lib/ai';
+import {
+  isPushSupported, getNotificationPermission, isDesktopPushEnabled,
+  enableDesktopPush, disableDesktopPush
+} from '../lib/push';
+import './Dashboard.css';
+import Profile from './Profile';
+import AIChatWidget from '../components/AIChatWidget';
+import { PieChart, Pie, Cell, Tooltip } from 'recharts';
+import {
+  HourglassIcon, DashboardIcon, TimesheetIcon, BellIcon,
+  ClockIcon, CoffeeIcon, CalendarIcon, PinIcon, MoonIcon, SunIcon,
+  ChevronDownIcon, SuitcaseIcon, AlertIcon, RefreshIcon
+} from '../icons';
+
+const TIME_OFF_TYPES = ['Annual Leave', 'Sick Leave', 'Unpaid Leave', 'Emergency Leave', 'Compassionate Leave'];
+
+// Grounds the support chat assistant — kept as plain text and handed to
+// the edge function as-is, rather than letting the model improvise
+// beyond what the app actually does.
+const EMPLOYEE_FAQ_TEXT = `
+- To clock in or out, use the buttons on the Clock In card on the Dashboard.
+- Clocking in outside the authorised location still works — it just gets flagged "Unauthorised" until an admin clears it. It never blocks you from working.
+- To take a break, press Break on the Clock In card; press Resume to end it.
+- To request time off, go to the Time Off tab. You can fill the form in yourself, or describe it in plain English and press "Fill form" to have it filled in for you, then check it and press Submit Request.
+- Time off requests need admin approval — check the Time Off tab for the status, and any note left when it's approved or rejected.
+- To change your profile picture, go to Profile and click the pencil icon on your avatar.
+- Email and department can't be changed from your own profile — contact an admin.
+- Dark mode is the toggle in the top right of the Dashboard page.
+- Break reminders appear at 2 hours (a gentle nudge) and 3 hours (a stronger one) of continuous clocked-in time; you're auto clocked out at 8 hours 15 minutes if you forget.
+`;
+
+function Dashboard({ user, onLogout }) {
+  const [profile, setProfile] = useState(null);
+  const [isClockedIn, setIsClockedIn] = useState(false);
+  const [isOnBreak, setIsOnBreak] = useState(false);
+  const [seconds, setSeconds] = useState(0);
+  // I'm tracking which of the four session reminders I've already fired,
+  // per clocked-in session, in a ref (not state) because I don't want
+  // setting these to trigger another render/effect pass. I used to check
+  // `seconds === 7200` etc., which only fires on the exact tick where my
+  // counter equals that number. The problem: `seconds` doesn't only move
+  // in steady +1 increments from my local timer — I also overwrite it
+  // every 30s from a server resync (`applyServerClockState`), and I
+  // recompute it from scratch on every mount/refresh. Both of those can
+  // jump `seconds` straight past an exact target value without ever
+  // landing on it, so the reminder silently never fires. Switching the
+  // checks below to `>=` plus these fired-flags means I catch the
+  // threshold even if I jump past it, but still only remind once per
+  // session instead of on every tick after the threshold.
+  const remindersFiredRef = useRef({
+    break2h: false,
+    break3h: false,
+    clockOut8h: false,
+    autoClockOut: false
+  });
+  // I'm keeping track of the clock_in_at timestamp my reminder flags were
+  // last reset for. I need this because I don't only start sessions
+  // locally through handleClockIn() — an admin can clock me in from the
+  // Employees tab, and my screen picks that up through the 30s
+  // syncClockStateFromServer() poll instead. Without comparing
+  // timestamps, that route would leave whatever fired-flags were left
+  // over from my previous session in place and could suppress reminders
+  // I should still get on this new one.
+  const lastRemindersResetForRef = useRef(null);
+  const [breakSeconds, setBreakSeconds] = useState(0);
+  const [reminder, setReminder] = useState('');
+  const [clockInTime, setClockInTime] = useState(null);
+  const [records, setRecords] = useState([]);
+  const [activePage, setActivePage] = useState('dashboard');
+  const [showBreakConfirm, setShowBreakConfirm] = useState(false);
+  const [timesheetViewMode, setTimesheetViewMode] = useState('monthly');
+  const [timesheetMonthDate, setTimesheetMonthDate] = useState(() => {
+    const d = new Date();
+    d.setDate(1);
+    d.setHours(0, 0, 0, 0);
+    return d;
+  });
+  const [timesheetSelectedDate, setTimesheetSelectedDate] = useState(null);
+  const [activitiesFilter, setActivitiesFilter] = useState('daily');
+  const [isDarkMode, setIsDarkMode] = useState(false);
+  const [locationStatus, setLocationStatus] = useState(null);
+  const [locationName, setLocationName] = useState('');
+  const [avatarUrl, setAvatarUrl] = useState(null);
+
+  // Time off
+  const [timeOffRequests, setTimeOffRequests] = useState([]);
+  const [timeOffType, setTimeOffType] = useState('');
+  const [timeOffStart, setTimeOffStart] = useState('');
+  const [timeOffEnd, setTimeOffEnd] = useState('');
+  const [timeOffReason, setTimeOffReason] = useState('');
+  const [timeOffError, setTimeOffError] = useState('');
+  const [timeOffSuccess, setTimeOffSuccess] = useState('');
+  const [timeOffSubmitting, setTimeOffSubmitting] = useState(false);
+  const [cancellingId, setCancellingId] = useState(null);
+
+  // AI features
+  const [weeklySummaryText, setWeeklySummaryText] = useState('');
+  const [weeklySummaryLoading, setWeeklySummaryLoading] = useState(false);
+  const [quickTimeOffText, setQuickTimeOffText] = useState('');
+  const [quickFillLoading, setQuickFillLoading] = useState(false);
+  const [quickFillError, setQuickFillError] = useState('');
+
+  // Optional reminders the person can toggle on/off. The three reminders
+  // already on the Reminders page are fixed defaults and are left alone.
+  // Location Alerts moved to the admin side — it's about which clock-ins
+  // get flagged for review, not something each employee tunes for themselves.
+  const [optionalReminders, setOptionalReminders] = useState({
+    weeklySummary: false,
+    missedClockIn: false
+  });
+
+  // Desktop push notification state — separate from optionalReminders
+  // above because this isn't a yes/no preference I just save to the
+  // database, it's tied to whether THIS browser actually has a live,
+  // working subscription right now (which involves the browser's own
+  // permission state too).
+  const [pushSupported, setPushSupported] = useState(true);
+  const [pushPermission, setPushPermission] = useState('default');
+  const [pushEnabled, setPushEnabled] = useState(false);
+  const [pushLoading, setPushLoading] = useState(false);
+  const [pushError, setPushError] = useState('');
+
+  const OFFICE_LAT = 5.5965681;
+  const OFFICE_LNG = -0.2240833;
+  const ALLOWED_RADIUS_METERS = 200;
+
+  function getCurrentTime() {
+    return new Date().toLocaleTimeString([], {
+      hour: '2-digit',
+      minute: '2-digit'
+    });
+  }
+
+  const [currentTime, setCurrentTime] = useState(getCurrentTime());
+
+  function getUsername() {
+    if (profile?.full_name) {
+      return profile.full_name;
+    }
+    if (user?.user_metadata?.full_name) {
+      return user.user_metadata.full_name;
+    }
+    return user?.email?.split('@')[0] || 'User';
+  }
+
+  function getFirstName() {
+    return getUsername().split(' ')[0];
+  }
+
+  function getUserRole() {
+    // profiles.department is the one an admin actually sets during
+    // approval — user_metadata.department is never written to, so it's
+    // kept only as a harmless fallback for older/test data.
+    return profile?.department || user?.user_metadata?.department || 'Employee';
+  }
+
+  function getUserCountry() {
+    return user?.user_metadata?.country || 'Ghana';
+  }
+
+  useEffect(() => {
+    if (user) {
+      loadRecords();
+      loadTimeOff();
+      loadProfile();
+      syncClockStateFromServer();
+      setAvatarUrl(TEST_MODE ? getAvatar(user.id) : (user?.user_metadata?.avatar_url || null));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user]);
+
+  async function loadProfile() {
+    if (TEST_MODE) return;
+
+    const { data, error } = await supabase
+      .from('profiles')
+      .select('*')
+      .eq('id', user.id)
+      .maybeSingle();
+
+    if (!error && data) {
+      setProfile(data);
+      if (data.optional_reminders) {
+        setOptionalReminders({
+          weeklySummary: !!data.optional_reminders.weeklySummary,
+          missedClockIn: !!data.optional_reminders.missedClockIn
+        });
+      }
+    }
+  }
+
+  // Applies a status row from employee_status (or mockData in TEST_MODE)
+  // to the local clock/break state. Used both on first load — so
+  // refreshing the page doesn't lose "currently clocked in" — and on
+  // every periodic sync below, so an admin clocking this employee in,
+  // out, or onto a break from the admin dashboard is reflected here too,
+  // instead of only changing the database while this screen keeps
+  // showing whatever it last showed locally.
+  function applyServerClockState(status) {
+    if (!status || status.status === 'not_clocked_in' || status.status === 'clocked_out') {
+      setIsClockedIn(false);
+      setIsOnBreak(false);
+      setSeconds(0);
+      setBreakSeconds(0);
+      // I'm clearing this so that whenever I next go clocked-in — from
+      // any source — it reads as a new session and my reminder flags
+      // get reset below instead of staying stuck from before.
+      lastRemindersResetForRef.current = null;
+      return;
+    }
+
+    const clockInAt = status.clock_in_at ? new Date(status.clock_in_at).getTime() : Date.now();
+    const breakAccum = status.break_accum_seconds || 0;
+
+    // If this clock_in_at is one I haven't reset my reminder flags for
+    // yet, it's a new session (whether I started it myself or an admin
+    // started it for me) — so I reset the flags now rather than only in
+    // handleClockIn, which this code path doesn't go through.
+    if (lastRemindersResetForRef.current !== clockInAt) {
+      lastRemindersResetForRef.current = clockInAt;
+      remindersFiredRef.current = {
+        break2h: false,
+        break3h: false,
+        clockOut8h: false,
+        autoClockOut: false
+      };
+    }
+
+    setIsClockedIn(true);
+    setClockInTime(new Date(clockInAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
+
+    if (status.status === 'on_break' && status.break_started_at) {
+      const breakStartAt = new Date(status.break_started_at).getTime();
+      setIsOnBreak(true);
+      setSeconds(Math.max(0, Math.round((breakStartAt - clockInAt) / 1000) - breakAccum));
+      setBreakSeconds(Math.max(0, Math.round((Date.now() - breakStartAt) / 1000)));
+    } else {
+      setIsOnBreak(false);
+      setBreakSeconds(0);
+      setSeconds(Math.max(0, Math.round((Date.now() - clockInAt) / 1000) - breakAccum));
+    }
+  }
+
+  async function syncClockStateFromServer() {
+    const status = await readEmployeeStatus();
+    applyServerClockState(status);
+  }
+
+  // Catches an admin deleting this employee's account while they're
+  // actively signed in, and also keeps time off status current without
+  // the employee needing to refresh the page after an admin approves or
+  // rejects a request.
+  useEffect(() => {
+    if (TEST_MODE || !user) return;
+
+    const interval = setInterval(async () => {
+      const { data, error } = await supabase
+        .from('profiles')
+        .select('id')
+        .eq('id', user.id)
+        .maybeSingle();
+
+      if (!error && !data) {
+        clearInterval(interval);
+        await supabase.auth.signOut();
+        alert('Your account access has been removed by an admin.');
+        onLogout();
+        return;
+      }
+
+      loadTimeOff();
+      syncClockStateFromServer();
+    }, 30000);
+
+    return () => clearInterval(interval);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user]);
+
+  async function loadRecords() {
+    if (TEST_MODE) {
+      setRecords(getRecords(user.id));
+      return;
+    }
+
+    const { data, error } = await supabase
+      .from('records')
+      .select('*')
+      .eq('user_id', user.id)
+      .order('created_at', { ascending: false });
+
+    if (!error && data) {
+      setRecords(data);
+    }
+  }
+
+  async function loadTimeOff() {
+    if (TEST_MODE) {
+      setTimeOffRequests(getTimeOffRequests(user.id));
+      return;
+    }
+
+    const { data, error } = await supabase
+      .from('time_off_requests')
+      .select('*')
+      .eq('user_id', user.id)
+      .order('created_at', { ascending: false });
+
+    if (!error && data) {
+      setTimeOffRequests(data);
+    }
+  }
+
+  useEffect(() => {
+    let timer;
+    if (isClockedIn && !isOnBreak) {
+      timer = setInterval(() => {
+        setSeconds(prev => prev + 1);
+      }, 1000);
+    }
+    if (isOnBreak) {
+      timer = setInterval(() => {
+        setBreakSeconds(prev => prev + 1);
+      }, 1000);
+    }
+    return () => clearInterval(timer);
+  }, [isClockedIn, isOnBreak]);
+
+  useEffect(() => {
+    const clock = setInterval(() => {
+      setCurrentTime(getCurrentTime());
+    }, 1000);
+    return () => clearInterval(clock);
+  }, []);
+
+  useEffect(() => {
+    if (!isClockedIn) return;
+
+    const fired = remindersFiredRef.current;
+
+    if (seconds >= 7200 && !fired.break2h) {
+      fired.break2h = true;
+      setReminder('You have been working for 2 hours. A short break can help.');
+      sendBrowserNotification('Break Nudge — Mmerℇ', 'You have been working for 2 hours. A short break can help.');
+    }
+    if (seconds >= 10800 && !fired.break3h) {
+      fired.break3h = true;
+      setReminder('You have been working for 3 hours. Time to take a break.');
+      sendBrowserNotification('Break Reminder — Mmerℇ', 'You have been working for 3 hours. Time to take a break.');
+      sendEmailNotification('Break Reminder — Mmerℇ', 'You have been working for 3 hours. Time to take a break.');
+    }
+    if (seconds >= 28800 && !fired.clockOut8h) {
+      fired.clockOut8h = true;
+      setReminder('You have worked 8 hours. Please clock out.');
+      sendBrowserNotification('Clock Out Reminder — Mmerℇ', 'You have worked 8 hours. Please clock out.');
+      sendEmailNotification('Clock Out Reminder — Mmerℇ', 'You have worked 8 hours. Please clock out.');
+    }
+    if (seconds >= 29700 && !fired.autoClockOut) {
+      fired.autoClockOut = true;
+      // I originally wrote a comment here claiming the actual clock-out
+      // is handled server-side by a scheduled database job in
+      // supabase/SYNC_AND_AUTOMATION_FIX.sql. I went looking for that
+      // file to fix it and it doesn't exist anywhere in this project —
+      // I never actually built it, I just wrote the comment as if I had.
+      // So right now this reminder, like the others, ONLY fires while
+      // this tab is open and mounted. There is no real auto clock-out
+      // happening anywhere else. I'm leaving this note here instead of
+      // the old comment so I stop trusting a safety net that isn't
+      // there. Until I build the real server-side job (Supabase Edge
+      // Function + pg_cron, checking employee_status.clock_in_at against
+      // now()), I should treat this purely as a heads-up to the
+      // employee, not as something that protects payroll data.
+      setReminder('You are being automatically clocked out.');
+      sendBrowserNotification('Auto Clock Out — Mmerℇ', 'You are being automatically clocked out after 8 hours 15 minutes.');
+      sendEmailNotification('Auto Clock Out — Mmerℇ', 'You are being automatically clocked out after 8 hours 15 minutes.');
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [seconds, isClockedIn]);
+
+  function getCurrentDate() {
+    return new Date().toLocaleDateString('en-GB', {
+      weekday: 'long',
+      year: 'numeric',
+      month: 'long',
+      day: 'numeric'
+    });
+  }
+
+  function formatDisplayDate(dateStr) {
+    const d = new Date(dateStr);
+    return d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
+  }
+
+  function formatTime(secs) {
+    const h = Math.floor(secs / 3600);
+    const m = Math.floor((secs % 3600) / 60);
+    const s = secs % 60;
+    return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+  }
+
+  function hmsToSeconds(str) {
+    if (!str) return 0;
+    const parts = str.split(':').map(Number);
+    return (parts[0] || 0) * 3600 + (parts[1] || 0) * 60 + (parts[2] || 0);
+  }
+
+  function getTotalHoursToday() {
+    const today = new Date().toLocaleDateString('en-GB');
+    const todayRecords = records.filter(r => r.date === today);
+    let totalSeconds = 0;
+    todayRecords.forEach(record => {
+      totalSeconds += hmsToSeconds(record.hours_worked);
+    });
+    const h = Math.floor(totalSeconds / 3600);
+    const m = Math.floor((totalSeconds % 3600) / 60);
+    const s = totalSeconds % 60;
+    return { h, m, s };
+  }
+
+  function getDistanceMeters(lat1, lng1, lat2, lng2) {
+    const R = 6371000;
+    const dLat = (lat2 - lat1) * Math.PI / 180;
+    const dLng = (lng2 - lng1) * Math.PI / 180;
+    const a =
+      Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+      Math.cos(lat1 * Math.PI / 180) *
+      Math.cos(lat2 * Math.PI / 180) *
+      Math.sin(dLng / 2) * Math.sin(dLng / 2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    return R * c;
+  }
+
+  function checkLocation() {
+    return new Promise((resolve) => {
+      if (!navigator.geolocation) {
+        setLocationStatus('unavailable');
+        setLocationName('Location unavailable');
+        resolve('unavailable');
+        return;
+      }
+      navigator.geolocation.getCurrentPosition(
+        (position) => {
+          const { latitude, longitude } = position.coords;
+          const distance = getDistanceMeters(latitude, longitude, OFFICE_LAT, OFFICE_LNG);
+          if (distance <= ALLOWED_RADIUS_METERS) {
+            setLocationStatus('authorised');
+            setLocationName('Authorised location');
+            resolve('authorised');
+          } else {
+            setLocationStatus('unauthorised');
+            setLocationName('Unauthorised location');
+            resolve('unauthorised');
+          }
+        },
+        () => {
+          setLocationStatus('unavailable');
+          setLocationName('Location unavailable');
+          resolve('unavailable');
+        }
+      );
+    });
+  }
+
+  async function saveRecord() {
+    const newRecord = {
+      user_id: user.id,
+      date: new Date().toLocaleDateString('en-GB'),
+      clock_in: clockInTime,
+      clock_out: getCurrentTime(),
+      hours_worked: formatTime(seconds),
+      break_time: formatTime(breakSeconds),
+      location_status: locationStatus || 'unavailable'
+    };
+
+    if (TEST_MODE) {
+      addRecord(newRecord);
+      await loadRecords();
+      return;
+    }
+
+    const { data, error } = await supabase
+      .from('records')
+      .insert([newRecord])
+      .select();
+    if (!error && data) {
+      await loadRecords();
+    } else {
+      console.log('Failed to save:', error);
+    }
+  }
+
+  function requestNotificationPermission() {
+    if ('Notification' in window) {
+      Notification.requestPermission();
+    }
+  }
+
+  function sendBrowserNotification(title, message) {
+    if ('Notification' in window && Notification.permission === 'granted') {
+      new Notification(title, { body: message });
+    }
+  }
+
+  function sendEmailNotification(title, message) {
+    if (TEST_MODE) {
+      // No real emails go out during UI testing.
+      console.log('[test mode] would send email:', title, message);
+      return;
+    }
+    emailjs.send('service_qo5r5ol', 'template_iyjajm8', {
+      title: title,
+      to_name: getUsername(),
+      to_email: user.email,
+      message: message
+    }, 'EWbasKvfwG1WXLCuA')
+    .then(() => console.log('Email sent successfully!'))
+    .catch((error) => console.log('Email error:', error));
+  }
+
+  // Reads/writes the shared "who's clocked in" status. In TEST_MODE this
+  // is localStorage (mockData.js); otherwise it's the real `employee_status`
+  // Supabase table, which is what lets the admin dashboard — and this
+  // employee's own session on another device — see it live.
+  async function readEmployeeStatus() {
+    if (TEST_MODE) return getEmployeeStatus(user.id);
+    const { data } = await supabase
+      .from('employee_status')
+      .select('*')
+      .eq('user_id', user.id)
+      .maybeSingle();
+    return data || { status: 'not_clocked_in', clock_in_at: null, break_started_at: null, break_accum_seconds: 0 };
+  }
+
+  async function syncEmployeeStatus(status) {
+    if (TEST_MODE) {
+      setEmployeeStatus(user.id, status);
+      return;
+    }
+    await supabase.from('employee_status').upsert({
+      user_id: user.id,
+      ...status,
+      updated_at: new Date().toISOString()
+    });
+  }
+
+  async function handleClockIn() {
+    const location = await checkLocation();
+
+    setIsClockedIn(true);
+    setIsOnBreak(false);
+    setSeconds(0);
+    setBreakSeconds(0);
+    setClockInTime(getCurrentTime());
+    requestNotificationPermission();
+    // Brand new session, so I'm clearing my fired-reminder flags — I want
+    // the 2hr/3hr/8hr/auto-clock-out reminders to be able to fire again
+    // for this fresh clock-in, not stay silenced because I already fired
+    // them once during an earlier session today.
+    remindersFiredRef.current = {
+      break2h: false,
+      break3h: false,
+      clockOut8h: false,
+      autoClockOut: false
+    };
+
+    // An unauthorised location no longer blocks the clock-in — it's
+    // allowed through but flagged, and an admin can authorise it later
+    // from the Timesheets tab.
+    if (location === 'unauthorised') {
+      setReminder('You have been clocked in, but your location could not be verified as authorised. This has been flagged for admin review.');
+    }
+
+    // Mirrors this onto the shared status store so the admin dashboard's
+    // Employees tab reflects it without needing a page refresh from them,
+    // and also resets the server-side "have I sent this reminder yet"
+    // flags for the new session — the reminder-sweep cron job (see
+    // supabase/functions/reminder-sweep) checks these before emailing me,
+    // so a fresh clock-in needs to start with all of them false again.
+    await syncEmployeeStatus({
+      status: 'clocked_in',
+      clock_in_at: new Date().toISOString(),
+      break_started_at: null,
+      break_accum_seconds: 0,
+      break_2h_sent: false,
+      break_3h_sent: false,
+      clock_out_8h_sent: false,
+      auto_clock_out_sent: false
+    });
+  }
+
+  async function handleClockOut() {
+    saveRecord();
+    setIsClockedIn(false);
+    setIsOnBreak(false);
+    setTimeout(() => {
+      setSeconds(0);
+      setBreakSeconds(0);
+    }, 500);
+    setReminder('');
+
+    await syncEmployeeStatus({
+      status: 'clocked_out',
+      clock_in_at: null,
+      break_started_at: null,
+      break_accum_seconds: 0
+    });
+  }
+
+  async function handleBreak() {
+    if (!isClockedIn) return;
+    if (!isOnBreak) {
+      setShowBreakConfirm(true);
+    } else {
+      setIsOnBreak(false);
+      setReminder('Break ended. Welcome back.');
+
+      const current = await readEmployeeStatus();
+      await syncEmployeeStatus({
+        ...current,
+        status: 'clocked_in',
+        break_started_at: null,
+        break_accum_seconds: (current.break_accum_seconds || 0) + breakSeconds
+      });
+    }
+  }
+
+  async function confirmBreak() {
+    setShowBreakConfirm(false);
+    setIsOnBreak(true);
+    setBreakSeconds(0);
+    setReminder('You are now on a break. Timer paused.');
+
+    const current = await readEmployeeStatus();
+    await syncEmployeeStatus({
+      ...current,
+      status: 'on_break',
+      break_started_at: new Date().toISOString()
+    });
+  }
+
+  function cancelBreak() {
+    setShowBreakConfirm(false);
+  }
+
+  function getStatus() {
+    if (!isClockedIn) return { text: 'Not Clocked In', tone: 'neutral' };
+    if (isOnBreak) return { text: 'On Break', tone: 'warning' };
+    return { text: 'Clocked In', tone: 'success' };
+  }
+
+  function getRecordsForPeriod(period) {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    if (period === 'today') {
+      return records.filter(r => {
+        const parts = r.date.split('/');
+        const recordDate = new Date(parts[2], parts[1] - 1, parts[0]);
+        recordDate.setHours(0, 0, 0, 0);
+        return recordDate.getTime() === today.getTime();
+      });
+    }
+    if (period === 'week') {
+      const startOfWeek = new Date(today);
+      const day = today.getDay();
+      const diff = today.getDate() - day + (day === 0 ? -6 : 1);
+      startOfWeek.setDate(diff);
+      startOfWeek.setHours(0, 0, 0, 0);
+      return records.filter(r => {
+        const parts = r.date.split('/');
+        const recordDate = new Date(parts[2], parts[1] - 1, parts[0]);
+        return recordDate >= startOfWeek;
+      });
+    }
+    if (period === 'month') {
+      const startOfMonth = new Date(today.getFullYear(), today.getMonth(), 1);
+      return records.filter(r => {
+        const parts = r.date.split('/');
+        const recordDate = new Date(parts[2], parts[1] - 1, parts[0]);
+        return recordDate >= startOfMonth;
+      });
+    }
+    return records;
+  }
+
+  function filteredRecords() {
+    return getRecordsForPeriod('all');
+  }
+
+  // ---------- Timesheet page: calendar view (mirrors the admin's) ----------
+
+  function parseRecordDate(dateStr) {
+    if (!dateStr) return null;
+    const [d, m, y] = dateStr.split('/').map(Number);
+    if (!d || !m || !y) return null;
+    return new Date(y, m - 1, d);
+  }
+
+  function isSameCalendarDay(a, b) {
+    return !!a && !!b &&
+      a.getFullYear() === b.getFullYear() &&
+      a.getMonth() === b.getMonth() &&
+      a.getDate() === b.getDate();
+  }
+
+  function getRecordsForDay(day) {
+    if (!day) return [];
+    return records.filter(r => isSameCalendarDay(parseRecordDate(r.date), day));
+  }
+
+  function getRecordsForCalendarMonth(monthDate) {
+    return records.filter(r => {
+      const d = parseRecordDate(r.date);
+      return d && d.getFullYear() === monthDate.getFullYear() && d.getMonth() === monthDate.getMonth();
+    });
+  }
+
+  function getCalendarWeekRange(date) {
+    const start = new Date(date);
+    start.setHours(0, 0, 0, 0);
+    start.setDate(start.getDate() - start.getDay());
+    const end = new Date(start);
+    end.setDate(start.getDate() + 6);
+    end.setHours(23, 59, 59, 999);
+    return [start, end];
+  }
+
+  function sumRecordsSeconds(recs) {
+    return recs.reduce((sum, r) => sum + hmsToSeconds(r.hours_worked), 0);
+  }
+
+  function buildMonthCells(monthDate) {
+    const year = monthDate.getFullYear();
+    const month = monthDate.getMonth();
+    const startWeekday = new Date(year, month, 1).getDay();
+    const daysInMonth = new Date(year, month + 1, 0).getDate();
+    const cells = [];
+    for (let i = 0; i < startWeekday; i++) cells.push(null);
+    for (let d = 1; d <= daysInMonth; d++) cells.push(new Date(year, month, d));
+    return cells;
+  }
+
+  function getActiveTimesheetDate() {
+    return timesheetSelectedDate || new Date();
+  }
+
+  function shiftTimesheetMonth(delta) {
+    setTimesheetMonthDate(prev => {
+      const next = new Date(prev);
+      next.setMonth(next.getMonth() + delta);
+      return next;
+    });
+    setTimesheetSelectedDate(null);
+  }
+
+  function shiftTimesheetPeriod(delta) {
+    if (timesheetViewMode === 'monthly') {
+      shiftTimesheetMonth(delta);
+      return;
+    }
+    const base = getActiveTimesheetDate();
+    const next = new Date(base);
+    next.setDate(next.getDate() + delta * (timesheetViewMode === 'weekly' ? 7 : 1));
+    setTimesheetSelectedDate(next);
+    setTimesheetMonthDate(new Date(next.getFullYear(), next.getMonth(), 1));
+  }
+
+  function getTimesheetPeriodLabel() {
+    if (timesheetViewMode === 'monthly') {
+      return timesheetMonthDate.toLocaleDateString('en-GB', { month: 'long', year: 'numeric' });
+    }
+    const base = getActiveTimesheetDate();
+    if (timesheetViewMode === 'weekly') {
+      const [start, end] = getCalendarWeekRange(base);
+      return `${start.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' })} – ${end.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}`;
+    }
+    return base.toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
+  }
+
+  function selectTimesheetMode(mode) {
+    setTimesheetViewMode(mode);
+    if (mode !== 'all' && !timesheetSelectedDate) setTimesheetSelectedDate(new Date());
+  }
+
+  function getTimesheetPeriodTotal() {
+    if (timesheetViewMode === 'daily') return sumRecordsSeconds(getRecordsForDay(getActiveTimesheetDate()));
+    if (timesheetViewMode === 'weekly') {
+      const [start, end] = getCalendarWeekRange(getActiveTimesheetDate());
+      return sumRecordsSeconds(records.filter(r => {
+        const d = parseRecordDate(r.date);
+        return d && d >= start && d <= end;
+      }));
+    }
+    if (timesheetViewMode === 'monthly') return sumRecordsSeconds(getRecordsForCalendarMonth(timesheetMonthDate));
+    return sumRecordsSeconds(filteredRecords());
+  }
+
+  // Powers the Activities card. "Daily" now adds together any sessions
+  // already completed today (clocked out earlier, e.g. after a lunch
+  // break) with whatever's still live right now — it used to only show
+  // the live timer, so a completed earlier session today vanished from
+  // the total. "Weekly"/"Monthly" already rolled up saved timesheet data
+  // correctly.
+  function getActivitiesStats() {
+    if (activitiesFilter === 'daily') {
+      const todayRecs = getRecordsForPeriod('today');
+      let completedWorked = 0;
+      let completedBreak = 0;
+      todayRecs.forEach(r => {
+        completedWorked += hmsToSeconds(r.hours_worked);
+        completedBreak += hmsToSeconds(r.break_time);
+      });
+
+      return {
+        workedSeconds: completedWorked + seconds,
+        breakSecondsVal: completedBreak + breakSeconds,
+        targetSeconds: 28800,
+        sessions: todayRecs.length + (isClockedIn ? 1 : 0),
+        label: "Today's Summary"
+      };
+    }
+
+    const period = activitiesFilter === 'weekly' ? 'week' : 'month';
+    const recs = getRecordsForPeriod(period);
+    let workedSecondsVal = 0;
+    let breakSecondsVal = 0;
+    recs.forEach(r => {
+      workedSecondsVal += hmsToSeconds(r.hours_worked);
+      breakSecondsVal += hmsToSeconds(r.break_time);
+    });
+
+    return {
+      workedSeconds: workedSecondsVal,
+      breakSecondsVal,
+      targetSeconds: activitiesFilter === 'weekly' ? 40 * 3600 : 160 * 3600,
+      sessions: recs.length,
+      label: activitiesFilter === 'weekly' ? "This Week's Summary" : "This Month's Summary"
+    };
+  }
+
+  // Merges the country's public holidays with the person's own time off
+  // (upcoming and already-taken) for the holidays card.
+  function getHolidaysAndTimeOff() {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    const holidayItems = getPublicHolidays(getUserCountry()).map(h => ({
+      date: h.date,
+      label: h.name,
+      kind: 'holiday'
+    }));
+
+    const timeOffItems = timeOffRequests
+      .filter(t => t.status !== 'rejected')
+      .map(t => ({
+        date: t.start_date,
+        label: t.type,
+        kind: 'timeoff',
+        status: t.status
+      }));
+
+    const all = [...holidayItems, ...timeOffItems].map(item => ({
+      ...item,
+      dateObj: new Date(item.date)
+    }));
+
+    const upcoming = all
+      .filter(i => i.dateObj >= today)
+      .sort((a, b) => a.dateObj - b.dateObj)
+      .slice(0, 5);
+
+    const taken = all
+      .filter(i => i.kind === 'timeoff' && i.dateObj < today)
+      .sort((a, b) => b.dateObj - a.dateObj)
+      .slice(0, 3);
+
+    return { upcoming, taken };
+  }
+
+  async function handleTimeOffSubmit() {
+    if (!timeOffType || !timeOffStart || !timeOffEnd) {
+      setTimeOffError('Please choose a leave type and both dates.');
+      setTimeOffSuccess('');
+      return;
+    }
+    if (new Date(timeOffEnd) < new Date(timeOffStart)) {
+      setTimeOffError('The end date cannot be before the start date.');
+      setTimeOffSuccess('');
+      return;
+    }
+
+    setTimeOffSubmitting(true);
+    setTimeOffError('');
+    setTimeOffSuccess('');
+
+    const request = {
+      user_id: user.id,
+      type: timeOffType,
+      start_date: timeOffStart,
+      end_date: timeOffEnd,
+      reason: timeOffReason
+    };
+
+    if (TEST_MODE) {
+      addTimeOffRequest(request);
+      setTimeOffRequests(getTimeOffRequests(user.id));
+      setTimeOffSuccess('Your time off request has been submitted for approval.');
+      setTimeOffType('');
+      setTimeOffStart('');
+      setTimeOffEnd('');
+      setTimeOffReason('');
+      setTimeOffSubmitting(false);
+      return;
+    }
+
+    const { error } = await supabase
+      .from('time_off_requests')
+      .insert([{ ...request, status: 'pending' }]);
+
+    setTimeOffSubmitting(false);
+    if (error) {
+      setTimeOffError('Could not submit your request. Please try again.');
+    } else {
+      setTimeOffSuccess('Your time off request has been submitted for approval.');
+      setTimeOffType('');
+      setTimeOffStart('');
+      setTimeOffEnd('');
+      setTimeOffReason('');
+      await loadTimeOff();
+    }
+  }
+
+  async function handleCancelTimeOff(requestId) {
+    setCancellingId(requestId);
+
+    if (TEST_MODE) {
+      cancelTimeOffRequest(requestId);
+      setTimeOffRequests(getTimeOffRequests(user.id));
+      setCancellingId(null);
+      return;
+    }
+
+    // Deleted rather than left in the table — a cancelled request an
+    // employee never sent for approval doesn't need to stick around for
+    // the admin to see.
+    await supabase
+      .from('time_off_requests')
+      .delete()
+      .eq('id', requestId)
+      .eq('user_id', user.id)
+      .eq('status', 'pending');
+
+    await loadTimeOff();
+    setCancellingId(null);
+  }
+
+  function toggleOptionalReminder(key) {
+    setOptionalReminders(prev => {
+      const next = { ...prev, [key]: !prev[key] };
+
+      if (!TEST_MODE) {
+        supabase
+          .from('profiles')
+          .update({ optional_reminders: next })
+          .eq('id', user.id)
+          .then(({ error }) => {
+            if (error) console.log('Failed to save reminder preference:', error);
+          });
+      }
+
+      return next;
+    });
+  }
+
+  // I'm checking this once when the person loads the app (not just when
+  // they open the Reminders page) so the button already shows the right
+  // state — On/Off/Blocked — the first time they see it, rather than
+  // flashing the wrong thing for a moment.
+  useEffect(() => {
+    if (!user || TEST_MODE) return;
+    setPushSupported(isPushSupported());
+    if (isPushSupported()) {
+      setPushPermission(getNotificationPermission());
+      isDesktopPushEnabled().then(setPushEnabled);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user]);
+
+  async function handleEnableDesktopPush() {
+    setPushLoading(true);
+    setPushError('');
+    try {
+      const result = await enableDesktopPush(user.id);
+      setPushPermission(result.permission);
+      setPushEnabled(result.enabled);
+      if (!result.enabled) {
+        // They said no (or dismissed) the browser's own permission
+        // prompt — that's their call, not an error on my end. I'm just
+        // reflecting it back accurately rather than pretending it worked.
+        setPushError('Notifications are blocked for this site. You can allow them in your browser\u2019s site settings, then try again.');
+      }
+    } catch (err) {
+      setPushError('Something went wrong turning notifications on. Please try again.');
+    }
+    setPushLoading(false);
+  }
+
+  async function handleDisableDesktopPush() {
+    setPushLoading(true);
+    setPushError('');
+    try {
+      await disableDesktopPush(user.id);
+      setPushEnabled(false);
+    } catch (err) {
+      setPushError('Something went wrong turning notifications off. Please try again.');
+    }
+    setPushLoading(false);
+  }
+
+  // ---------- AI: natural-language time off ----------
+  // Parses free text into the request form's fields — the person still
+  // reviews and submits it themselves, this just saves the typing.
+  async function handleQuickFillTimeOff() {
+    if (!quickTimeOffText.trim()) return;
+    setQuickFillLoading(true);
+    setQuickFillError('');
+    try {
+      const today = new Date().toISOString().split('T')[0];
+      const result = await callAI('parse_time_off', { text: quickTimeOffText, today });
+      if (result.type) setTimeOffType(result.type);
+      if (result.start_date) setTimeOffStart(result.start_date);
+      if (result.end_date) setTimeOffEnd(result.end_date);
+      if (result.reason) setTimeOffReason(result.reason);
+    } catch (err) {
+      setQuickFillError("Couldn't read that — please fill the form in below instead.");
+    }
+    setQuickFillLoading(false);
+  }
+
+  // ---------- AI: weekly summary ----------
+  // Generated on demand rather than emailed on a schedule — a scheduled
+  // version needs a cron job on the backend, which is a follow-up step.
+  async function handleGenerateWeeklySummary() {
+    setWeeklySummaryLoading(true);
+    setWeeklySummaryText('');
+    try {
+      const weekRecords = getRecordsForPeriod('week');
+      let workedSecondsTotal = 0;
+      let breakSecondsTotal = 0;
+      weekRecords.forEach(r => {
+        workedSecondsTotal += hmsToSeconds(r.hours_worked);
+        breakSecondsTotal += hmsToSeconds(r.break_time);
+      });
+      const approvedTimeOffCount = timeOffRequests.filter(t => t.status === 'approved').length;
+
+      const result = await callAI('weekly_summary', {
+        employeeName: getFirstName(),
+        weekLabel: 'this week',
+        hoursWorked: `${Math.floor(workedSecondsTotal / 3600)}h ${Math.floor((workedSecondsTotal % 3600) / 60)}m`,
+        breakHours: `${Math.floor(breakSecondsTotal / 3600)}h ${Math.floor((breakSecondsTotal % 3600) / 60)}m`,
+        sessionsCount: weekRecords.length,
+        timeOffDays: approvedTimeOffCount
+      });
+      setWeeklySummaryText(result.message);
+    } catch (err) {
+      setWeeklySummaryText("Couldn't generate a summary right now — please try again shortly.");
+    }
+    setWeeklySummaryLoading(false);
+  }
+
+  function buildChatContext() {
+    const stats = getActivitiesStats();
+    const pendingCount = timeOffRequests.filter(t => t.status === 'pending').length;
+    return {
+      faq: EMPLOYEE_FAQ_TEXT,
+      employeeData: `Name: ${getUsername()}. Currently: ${getStatus().text}. ` +
+        `Hours worked today: ${Math.floor(stats.workedSeconds / 3600)}h ${Math.floor((stats.workedSeconds % 3600) / 60)}m. ` +
+        `Pending time off requests: ${pendingCount}. Country: ${getUserCountry()}.`
+    };
+  }
+
+  const status = getStatus();
+  const activityStats = getActivitiesStats();
+  const holidaysData = getHolidaysAndTimeOff();
+
+  return (
+    <div className={`dashboard-layout ${isDarkMode ? 'dark' : ''}`}>
+
+      {/* Break Confirmation Popup */}
+      {showBreakConfirm && (
+        <div className="popup-overlay">
+          <div className="popup-box">
+            <h3>Going on break?</h3>
+            <p>Are you sure you want to go on break? Your work timer will be paused.</p>
+            <div className="popup-buttons">
+              <button className="popup-cancel" onClick={cancelBreak}>Cancel</button>
+              <button className="popup-confirm" onClick={confirmBreak}>Yes, go on break</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Sidebar */}
+      <div className="sidebar">
+        <div className="sidebar-brand">
+          <HourglassIcon width={20} height={20} />
+          <span className="brand-name">Mmerℇ</span>
+        </div>
+        <nav className="sidebar-nav">
+          <button
+            className={`nav-item ${activePage === 'dashboard' ? 'active' : ''}`}
+            onClick={() => setActivePage('dashboard')}>
+            <DashboardIcon width={17} height={17} /> Dashboard
+          </button>
+          <button
+            className={`nav-item ${activePage === 'timesheet' ? 'active' : ''}`}
+            onClick={() => setActivePage('timesheet')}>
+            <TimesheetIcon width={17} height={17} /> Timesheet
+          </button>
+          <button
+            className={`nav-item ${activePage === 'timeoff' ? 'active' : ''}`}
+            onClick={() => setActivePage('timeoff')}>
+            <SuitcaseIcon width={17} height={17} /> Time Off
+          </button>
+          <button
+            className={`nav-item ${activePage === 'reminders' ? 'active' : ''}`}
+            onClick={() => setActivePage('reminders')}>
+            <BellIcon width={17} height={17} /> Reminders
+          </button>
+        </nav>
+        <div
+          className="sidebar-user"
+          onClick={() => setActivePage('profile')}
+          title="Click to view profile">
+          {avatarUrl ? (
+            <img src={avatarUrl} alt="" className="user-avatar user-avatar-img" />
+          ) : (
+            <div className="user-avatar">{getFirstName()[0]}</div>
+          )}
+          <div className="user-info">
+            <p className="user-name">{getUsername()}</p>
+            <p className="user-role">View profile</p>
+          </div>
+        </div>
+        <button className="sidebar-signout" onClick={onLogout}>Sign Out</button>
+      </div>
+
+      {/* Main Content */}
+      <div className="main-content">
+
+        {/* ===== DASHBOARD PAGE ===== */}
+        {activePage === 'dashboard' && (
+          <div className="page">
+
+            {/* Header */}
+            <div className="page-header">
+              <div className="header-welcome">
+                {avatarUrl ? (
+                  <img src={avatarUrl} alt="" className="header-avatar header-avatar-img" />
+                ) : (
+                  <div className="header-avatar">{getFirstName()[0]}</div>
+                )}
+                <div>
+                  <h1>Welcome, {getUsername()}</h1>
+                  <p className="page-date">{getUserRole()} · {getCurrentDate()} · {currentTime}</p>
+                </div>
+              </div>
+              <div className="header-right">
+                <button
+                  className="dark-mode-toggle"
+                  onClick={() => setIsDarkMode(prev => !prev)}>
+                  {isDarkMode ? <SunIcon width={16} height={16} /> : <MoonIcon width={16} height={16} />}
+                  {isDarkMode ? 'Light' : 'Dark'}
+                </button>
+              </div>
+            </div>
+
+            {/* Reminder Banner */}
+            {reminder && (
+              <div className="reminder-banner">
+                {reminder}
+                <button onClick={() => setReminder('')}>✕</button>
+              </div>
+            )}
+
+            {/* Three Cards Row */}
+            <div className="three-cards-row">
+
+              {/* Card 1 — Clock In */}
+              <div className="main-card clock-card">
+                <div className="card-header">
+                  <ClockIcon width={17} height={17} className="card-icon" />
+                  <span className="card-title">Clock In</span>
+                  <span className={`card-status-badge status-${status.tone}`}>
+                    {isClockedIn ? (isOnBreak ? 'On Break' : 'Ongoing') : 'Inactive'}
+                  </span>
+                </div>
+                {locationStatus && (
+                  <div className={`location-badge location-${locationStatus}`}>
+                    <PinIcon width={13} height={13} /> {locationName}
+                  </div>
+                )}
+                <div className="card-timer">{formatTime(seconds)}</div>
+                {isOnBreak && (
+                  <div className="break-timer"><CoffeeIcon width={13} height={13} /> Break: {formatTime(breakSeconds)}</div>
+                )}
+                <div className="card-buttons">
+                  <button className="btn-clockin" onClick={handleClockIn} disabled={isClockedIn}>
+                    Clock In
+                  </button>
+                  <button className="btn-break" onClick={handleBreak} disabled={!isClockedIn}>
+                    {isOnBreak ? 'Resume' : 'Break'}
+                  </button>
+                  {!isOnBreak && isClockedIn && (
+                    <button className="btn-clockout" onClick={handleClockOut}>Clock Out</button>
+                  )}
+                </div>
+              </div>
+
+              {/* Card 2 — Planned Hours */}
+              <div className="main-card planned-card">
+                <div className="card-header">
+                  <CalendarIcon width={17} height={17} className="card-icon" />
+                  <span className="card-title">Planned Hours</span>
+                </div>
+                <div className="planned-hours-display">
+                  <div className="planned-big">
+                    <span className="planned-num">40</span>
+                    <span className="planned-unit">hrs</span>
+                    <span className="planned-num">00</span>
+                    <span className="planned-unit">mins</span>
+                  </div>
+                  <p className="planned-label">Total hours (Weekly)</p>
+                  <div className="planned-divider"></div>
+                  <div className="planned-big" style={{marginTop: '12px'}}>
+                    <span className="planned-num">8</span>
+                    <span className="planned-unit">hrs</span>
+                    <span className="planned-num">00</span>
+                    <span className="planned-unit">mins</span>
+                  </div>
+                  <p className="planned-label">Total hours (Daily)</p>
+                  <div className="planned-divider"></div>
+                  <p className="planned-note">Each employee should complete their total daily and weekly planned hours.</p>
+                </div>
+              </div>
+
+              {/* Card 3 — Worked Hours */}
+              <div className="main-card worked-card">
+                <div className="card-header">
+                  <ClockIcon width={17} height={17} className="card-icon" />
+                  <span className="card-title">Worked Hours</span>
+                </div>
+                <div className="worked-hours-display">
+                  <p className="worked-label">Total hours (Today)</p>
+                  <div className="worked-big">
+                    <span className="worked-num">{getTotalHoursToday().h}</span>
+                    <span className="worked-unit">hrs</span>
+                    <span className="worked-num">{String(getTotalHoursToday().m).padStart(2,'0')}</span>
+                    <span className="worked-unit">mins</span>
+                    <span className="worked-num">{String(getTotalHoursToday().s).padStart(2,'0')}</span>
+                    <span className="worked-unit">secs</span>
+                  </div>
+                  <div className="planned-divider"></div>
+                  <p className="worked-label">Sessions Today</p>
+                  <div className="worked-sessions">
+                    {getRecordsForPeriod('today').length}
+                  </div>
+                  <div className="planned-divider"></div>
+                  <p className="planned-note">Total time worked today, not including break time.</p>
+                </div>
+              </div>
+
+            </div>
+            {/* END Three Cards Row */}
+
+            {/* Bottom Cards Row */}
+            <div className="bottom-cards-row">
+
+              {/* Holidays Card */}
+              <div className="bottom-card">
+                <h3 className="bottom-card-title">Upcoming holidays and time off</h3>
+                {holidaysData.upcoming.length === 0 && holidaysData.taken.length === 0 ? (
+                  <div className="holidays-empty">
+                    <p>No upcoming holidays</p>
+                  </div>
+                ) : (
+                  <div className="holidays-list">
+                    {holidaysData.upcoming.map((item, i) => (
+                      <div className="holiday-row" key={`u-${i}`}>
+                        <div className="holiday-date">{formatDisplayDate(item.date)}</div>
+                        <div className="holiday-info">
+                          <span className="holiday-label">{item.label}</span>
+                          <span className={`holiday-tag ${item.kind === 'holiday' ? 'holiday-tag-holiday' : `holiday-tag-${item.status}`}`}>
+                            {item.kind === 'holiday' ? 'Public holiday' : item.status === 'approved' ? 'Approved' : 'Pending'}
+                          </span>
+                        </div>
+                      </div>
+                    ))}
+                    {holidaysData.taken.length > 0 && (
+                      <>
+                        <p className="holidays-subheading">Recently taken</p>
+                        {holidaysData.taken.map((item, i) => (
+                          <div className="holiday-row" key={`t-${i}`}>
+                            <div className="holiday-date">{formatDisplayDate(item.date)}</div>
+                            <div className="holiday-info">
+                              <span className="holiday-label">{item.label}</span>
+                              <span className="holiday-tag holiday-tag-taken">Taken</span>
+                            </div>
+                          </div>
+                        ))}
+                      </>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              {/* Activities Card */}
+              <div className="bottom-card">
+                <div className="bottom-card-header-row">
+                  <h3 className="bottom-card-title">Activities</h3>
+                  <div className="activities-filter">
+                    <select
+                      value={activitiesFilter}
+                      onChange={e => setActivitiesFilter(e.target.value)}
+                      aria-label="Filter activities by period">
+                      <option value="daily">Daily</option>
+                      <option value="weekly">Weekly</option>
+                      <option value="monthly">Monthly</option>
+                    </select>
+                    <ChevronDownIcon width={13} height={13} className="activities-filter-caret" />
+                  </div>
+                </div>
+                <div className="activities-content">
+                  <div className="donut-wrapper">
+                    <PieChart width={180} height={180}>
+                      <Pie
+                        data={[
+                          { name: 'Worked', value: activityStats.workedSeconds > 0 ? activityStats.workedSeconds : 1 },
+                          { name: 'Remaining', value: activityStats.workedSeconds > 0 ? Math.max(activityStats.targetSeconds - activityStats.workedSeconds, 0) : activityStats.targetSeconds }
+                        ]}
+                        cx={85}
+                        cy={85}
+                        innerRadius={55}
+                        outerRadius={80}
+                        dataKey="value"
+                        startAngle={90}
+                        endAngle={-270}>
+                        <Cell fill="#2563EB" />
+                        <Cell fill="#E2E8F0" />
+                      </Pie>
+                      <Tooltip
+                        formatter={(value) => {
+                          const h = Math.floor(value / 3600);
+                          const m = Math.floor((value % 3600) / 60);
+                          return `${h}h ${m}m`;
+                        }}
+                      />
+                    </PieChart>
+                    <div className="donut-center">
+                      <p className="donut-label">clocked</p>
+                      <p className="donut-value">
+                        {Math.floor(activityStats.workedSeconds / 3600)}h {Math.floor((activityStats.workedSeconds % 3600) / 60)}m
+                      </p>
+                    </div>
+                  </div>
+                  <div className="activities-legend">
+                    <p className="activities-subtitle">{activityStats.label}</p>
+                    <div className="legend-item">
+                      <span className="legend-dot" style={{backgroundColor: '#2563EB'}}></span>
+                      <span>Working time — {Math.floor(activityStats.workedSeconds / 3600)}h {Math.floor((activityStats.workedSeconds % 3600) / 60)}m</span>
+                    </div>
+                    <div className="legend-item">
+                      <span className="legend-dot" style={{backgroundColor: '#B45309'}}></span>
+                      <span>Break time — {Math.floor(activityStats.breakSecondsVal / 3600)}h {Math.floor((activityStats.breakSecondsVal % 3600) / 60)}m</span>
+                    </div>
+                    <div className="legend-item">
+                      <span className="legend-dot" style={{backgroundColor: '#E2E8F0'}}></span>
+                      <span>Remaining — {Math.floor(Math.max(activityStats.targetSeconds - activityStats.workedSeconds, 0) / 3600)}h {Math.floor((Math.max(activityStats.targetSeconds - activityStats.workedSeconds, 0) % 3600) / 60)}m</span>
+                    </div>
+                    <div className="legend-item">
+                      <span className="legend-dot" style={{backgroundColor: '#15803D'}}></span>
+                      <span>Sessions — {activityStats.sessions}</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+            </div>
+            {/* END Bottom Cards Row */}
+
+          </div>
+        )}
+        {/* ===== END DASHBOARD PAGE ===== */}
+
+        {/* ===== TIMESHEET PAGE ===== */}
+        {activePage === 'timesheet' && (
+          <div className="page">
+            <div className="page-header">
+              <h1>Timesheet</h1>
+              <p className="page-date">{getCurrentDate()}</p>
+            </div>
+
+            <div className="timesheet-controls">
+              <div className="timesheet-view-toggle">
+                {['daily', 'weekly', 'monthly', 'all'].map(mode => (
+                  <button
+                    key={mode}
+                    className={`timesheet-view-btn ${timesheetViewMode === mode ? 'active' : ''}`}
+                    onClick={() => selectTimesheetMode(mode)}>
+                    {mode === 'daily' ? 'Daily' : mode === 'weekly' ? 'Weekly' : mode === 'monthly' ? 'Monthly' : 'All Records'}
+                  </button>
+                ))}
+              </div>
+
+              {timesheetViewMode !== 'all' && (
+                <div className="timesheet-month-nav">
+                  <button className="timesheet-month-btn" onClick={() => shiftTimesheetPeriod(-1)} aria-label="Previous period">‹</button>
+                  <span className="timesheet-month-label">{getTimesheetPeriodLabel()}</span>
+                  <button className="timesheet-month-btn" onClick={() => shiftTimesheetPeriod(1)} aria-label="Next period">›</button>
+                </div>
+              )}
+            </div>
+
+            {timesheetViewMode !== 'all' && (
+              <div className="timesheet-period-total">
+                <span>Total: <strong>{formatTime(getTimesheetPeriodTotal())}</strong></span>
+              </div>
+            )}
+
+            {timesheetViewMode === 'monthly' && (
+              <div className="timesheet-calendar-card">
+                <div className="timesheet-calendar-weekdays">
+                  {['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map(d => (
+                    <span key={d}>{d}</span>
+                  ))}
+                </div>
+                <div className="timesheet-calendar-grid">
+                  {buildMonthCells(timesheetMonthDate).map((day, i) => {
+                    if (!day) return <div key={`blank-${i}`} className="timesheet-day-cell empty" />;
+                    const dayRecs = getRecordsForDay(day);
+                    const totalSecs = sumRecordsSeconds(dayRecs);
+                    const isSelected = isSameCalendarDay(day, timesheetSelectedDate);
+                    const isToday = isSameCalendarDay(day, new Date());
+
+                    return (
+                      <button
+                        key={day.toISOString()}
+                        className={`timesheet-day-cell ${dayRecs.length ? 'has-records' : ''} ${isSelected ? 'selected' : ''} ${isToday ? 'today' : ''}`}
+                        onClick={() => setTimesheetSelectedDate(day)}>
+                        <span className="timesheet-day-number">{day.getDate()}</span>
+                        {dayRecs.length > 0 && (
+                          <span className="timesheet-day-hours">{formatTime(totalSecs).slice(0, 5)}</span>
+                        )}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {timesheetViewMode === 'weekly' && (() => {
+              const [weekStart] = getCalendarWeekRange(getActiveTimesheetDate());
+              const weekDays = Array.from({ length: 7 }, (_, i) => {
+                const d = new Date(weekStart);
+                d.setDate(weekStart.getDate() + i);
+                return d;
+              });
+              return (
+                <div className="timesheet-week-card">
+                  {weekDays.map(day => {
+                    const dayRecs = getRecordsForDay(day);
+                    const totalSecs = sumRecordsSeconds(dayRecs);
+                    const isSelected = isSameCalendarDay(day, timesheetSelectedDate);
+                    const isToday = isSameCalendarDay(day, new Date());
+
+                    return (
+                      <button
+                        key={day.toISOString()}
+                        className={`timesheet-week-cell ${dayRecs.length ? 'has-records' : ''} ${isSelected ? 'selected' : ''} ${isToday ? 'today' : ''}`}
+                        onClick={() => setTimesheetSelectedDate(day)}>
+                        <span className="timesheet-week-dayname">{day.toLocaleDateString('en-GB', { weekday: 'short' })}</span>
+                        <span className="timesheet-week-daynum">{day.getDate()}</span>
+                        {dayRecs.length > 0 && (
+                          <span className="timesheet-day-hours">{formatTime(totalSecs).slice(0, 5)}</span>
+                        )}
+                      </button>
+                    );
+                  })}
+                </div>
+              );
+            })()}
+
+            {timesheetViewMode !== 'all' && (timesheetViewMode !== 'monthly' || timesheetSelectedDate) && (
+              <div className="timesheet-day-detail">
+                <h3>
+                  {getActiveTimesheetDate().toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })}
+                </h3>
+                {getRecordsForDay(getActiveTimesheetDate()).length === 0 ? (
+                  <p className="timesheet-day-empty">No session recorded this day.</p>
+                ) : (
+                  getRecordsForDay(getActiveTimesheetDate()).map((record, i) => (
+                    <div className="timesheet-day-record" key={record.id || i}>
+                      <div className="timesheet-day-record-grid">
+                        <div>
+                          <span className="timesheet-field-label">Clock In</span>
+                          <p>{record.clock_in}</p>
+                        </div>
+                        <div>
+                          <span className="timesheet-field-label">Clock Out</span>
+                          <p>{record.clock_out}</p>
+                        </div>
+                        <div>
+                          <span className="timesheet-field-label">Break Time</span>
+                          <p className="cell-warning">{record.break_time}</p>
+                        </div>
+                        <div>
+                          <span className="timesheet-field-label">Hours Worked</span>
+                          <p className="cell-success">{record.hours_worked}</p>
+                        </div>
+                        <div>
+                          <span className="timesheet-field-label">Location</span>
+                          <p>
+                            <span className={`location-tag location-tag-${record.location_status || 'unavailable'}`}>
+                              {record.location_status === 'authorised' ? 'Authorised' :
+                               record.location_status === 'unauthorised' ? 'Unauthorised' : 'N/A'}
+                            </span>
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
+            )}
+
+            {timesheetViewMode === 'all' && (
+              filteredRecords().length === 0 ? (
+                <div className="empty-state">
+                  <p>No sessions recorded yet.</p>
+                  <p>Clock in to start tracking your time.</p>
+                </div>
+              ) : (
+                <div className="table-card">
+                  <table className="timesheet-table">
+                    <thead>
+                      <tr>
+                        <th>Date</th>
+                        <th>Clock In</th>
+                        <th>Clock Out</th>
+                        <th>Break Time</th>
+                        <th>Hours Worked</th>
+                        <th>Location</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {filteredRecords().map((record, index) => (
+                        <tr key={index}>
+                          <td>{record.date}</td>
+                          <td>{record.clock_in}</td>
+                          <td>{record.clock_out}</td>
+                          <td className="cell-warning">{record.break_time}</td>
+                          <td className="cell-success">{record.hours_worked}</td>
+                          <td>
+                            <span className={`location-tag location-tag-${record.location_status || 'unavailable'}`}>
+                              {record.location_status === 'authorised' ? 'Authorised' :
+                               record.location_status === 'unauthorised' ? 'Unauthorised' : 'N/A'}
+                            </span>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )
+            )}
+          </div>
+        )}
+
+        {/* ===== TIME OFF PAGE ===== */}
+        {activePage === 'timeoff' && (
+          <div className="page">
+            <div className="page-header">
+              <h1>Time Off</h1>
+              <p className="page-date">Request leave and track past requests</p>
+            </div>
+
+            <div className="timeoff-layout">
+              <div className="timeoff-form-card">
+                <h3>Request time off</h3>
+
+                <div className="ai-quick-fill">
+                  <label>Describe it in plain English (optional)</label>
+                  <div className="ai-quick-fill-row">
+                    <input
+                      type="text"
+                      placeholder="e.g. next Friday off for a doctor's appointment"
+                      value={quickTimeOffText}
+                      onChange={e => setQuickTimeOffText(e.target.value)}
+                    />
+                    <button
+                      type="button"
+                      className="btn-secondary ai-quick-fill-btn"
+                      onClick={handleQuickFillTimeOff}
+                      disabled={quickFillLoading || !quickTimeOffText.trim()}>
+                      {quickFillLoading ? 'Thinking...' : 'Fill form'}
+                    </button>
+                  </div>
+                  {quickFillError && <p className="form-alert">{quickFillError}</p>}
+                </div>
+
+                {timeOffError && <p className="form-alert">{timeOffError}</p>}
+                {timeOffSuccess && <p className="form-success">{timeOffSuccess}</p>}
+
+                <div className="input-group">
+                  <label>Type</label>
+                  <select
+                    value={timeOffType}
+                    onChange={e => setTimeOffType(e.target.value)}>
+                    <option value="">Select a type</option>
+                    {TIME_OFF_TYPES.map(t => (
+                      <option key={t} value={t}>{t}</option>
+                    ))}
+                  </select>
+                </div>
+
+                <div className="timeoff-dates-row">
+                  <div className="input-group">
+                    <label>Start date</label>
+                    <input
+                      type="date"
+                      value={timeOffStart}
+                      onChange={e => setTimeOffStart(e.target.value)}
+                    />
+                  </div>
+                  <div className="input-group">
+                    <label>End date</label>
+                    <input
+                      type="date"
+                      value={timeOffEnd}
+                      onChange={e => setTimeOffEnd(e.target.value)}
+                    />
+                  </div>
+                </div>
+
+                <div className="input-group">
+                  <label>Reason (optional)</label>
+                  <textarea
+                    rows={3}
+                    placeholder="Add any detail worth sharing with your manager"
+                    value={timeOffReason}
+                    onChange={e => setTimeOffReason(e.target.value)}
+                  />
+                </div>
+
+                <button
+                  className="btn-primary"
+                  onClick={handleTimeOffSubmit}
+                  disabled={timeOffSubmitting}>
+                  {timeOffSubmitting ? 'Submitting...' : 'Submit Request'}
+                </button>
+              </div>
+
+              <div className="timeoff-history-card">
+                <div className="timeoff-history-header">
+                  <h3>Your requests</h3>
+                  <button
+                    type="button"
+                    className="timeoff-refresh-btn"
+                    onClick={loadTimeOff}
+                    title="Check for updates">
+                    <RefreshIcon width={14} height={14} /> Refresh
+                  </button>
+                </div>
+                {timeOffRequests.length === 0 ? (
+                  <div className="empty-state">
+                    <p>No time off requested yet.</p>
+                  </div>
+                ) : (
+                  <div className="timeoff-history-list">
+                    {timeOffRequests.map((req, i) => (
+                      <div className="timeoff-history-row" key={req.id || i}>
+                        <div className="timeoff-history-row-top">
+                          <div>
+                            <p className="timeoff-history-type">{req.type}</p>
+                            <p className="timeoff-history-dates">
+                              {formatDisplayDate(req.start_date)}
+                              {req.end_date && req.end_date !== req.start_date ? ` – ${formatDisplayDate(req.end_date)}` : ''}
+                            </p>
+                            {req.reason && <p className="timeoff-history-reason">{req.reason}</p>}
+                          </div>
+                          <div className="timeoff-history-status">
+                            <span className={`holiday-tag holiday-tag-${req.status}`}>
+                              {req.status === 'approved' ? 'Approved' : req.status === 'rejected' ? 'Rejected' : 'Pending'}
+                            </span>
+                            {req.status === 'pending' && (
+                              <button
+                                className="timeoff-cancel-btn"
+                                disabled={cancellingId === req.id}
+                                onClick={() => handleCancelTimeOff(req.id)}>
+                                {cancellingId === req.id ? 'Cancelling...' : 'Cancel'}
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                        {req.admin_message && (
+                          <div className="timeoff-history-response">
+                            <span className="timeoff-history-response-label">Admin response</span>
+                            <p className="timeoff-history-response-text">{req.admin_message}</p>
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ===== REMINDERS PAGE ===== */}
+        {activePage === 'reminders' && (
+          <div className="page">
+            <div className="page-header">
+              <h1>Smart Reminders</h1>
+              <p className="page-date">Your automated reminder settings</p>
+            </div>
+            <div className="reminders-list">
+              <div className="reminder-item">
+                <div className="reminder-icon"><ClockIcon width={18} height={18} /></div>
+                <div className="reminder-info">
+                  <h3>Break Reminder</h3>
+                  <p>You will be reminded to take a break after 3 hours of work</p>
+                </div>
+                <div className="reminder-badge active">Active</div>
+              </div>
+              <div className="reminder-item">
+                <div className="reminder-icon"><BellIcon width={18} height={18} /></div>
+                <div className="reminder-info">
+                  <h3>Clock Out Reminder</h3>
+                  <p>You will be reminded to clock out after 8 hours of work</p>
+                </div>
+                <div className="reminder-badge active">Active</div>
+              </div>
+              <div className="reminder-item">
+                <div className="reminder-icon"><CoffeeIcon width={18} height={18} /></div>
+                <div className="reminder-info">
+                  <h3>Auto Clock Out</h3>
+                  <p>You will be automatically clocked out after 8 hours 15 minutes</p>
+                </div>
+                <div className="reminder-badge active">Active</div>
+              </div>
+            </div>
+
+            <h2 className="reminders-subheading">Optional reminders</h2>
+            <p className="page-date reminders-subnote">Switch these on or off to suit how you like to work</p>
+            <div className="reminders-list">
+              <div className="reminder-item">
+                <div className="reminder-icon"><BellIcon width={18} height={18} /></div>
+                <div className="reminder-info">
+                  <h3>Desktop Notifications</h3>
+                  <p>
+                    {!pushSupported && 'This browser doesn\u2019t support desktop notifications.'}
+                    {pushSupported && pushPermission === 'denied' && 'Blocked in this browser\u2019s settings for this site.'}
+                    {pushSupported && pushPermission !== 'denied' && 'Get these reminders on this device, even with the tab closed'}
+                  </p>
+                  {pushError && <p style={{ color: '#e5484d' }}>{pushError}</p>}
+                </div>
+                <label className="toggle-switch">
+                  <input
+                    type="checkbox"
+                    checked={pushEnabled}
+                    disabled={!pushSupported || pushPermission === 'denied' || pushLoading}
+                    onChange={() => (pushEnabled ? handleDisableDesktopPush() : handleEnableDesktopPush())}
+                  />
+                  <span className="toggle-slider"></span>
+                </label>
+              </div>
+
+              <div className="reminder-item">
+                <div className="reminder-icon"><CalendarIcon width={18} height={18} /></div>
+                <div className="reminder-info">
+                  <h3>Weekly Summary Email</h3>
+                  <p>Get a weekly email summarising your hours, breaks and time off</p>
+                </div>
+                <label className="toggle-switch">
+                  <input
+                    type="checkbox"
+                    checked={optionalReminders.weeklySummary}
+                    onChange={() => toggleOptionalReminder('weeklySummary')}
+                  />
+                  <span className="toggle-slider"></span>
+                </label>
+              </div>
+
+              {optionalReminders.weeklySummary && (
+                <div className="ai-summary-preview">
+                  <div className="ai-summary-preview-header">
+                    <p>Automated weekly emails need a scheduled job on the backend, which isn't set up yet — in the meantime, generate a preview any time:</p>
+                    <button className="btn-secondary" onClick={handleGenerateWeeklySummary} disabled={weeklySummaryLoading}>
+                      {weeklySummaryLoading ? 'Writing...' : 'Preview this week\u2019s summary'}
+                    </button>
+                  </div>
+                  {weeklySummaryText && <p className="ai-summary-text">{weeklySummaryText}</p>}
+                </div>
+              )}
+              <div className="reminder-item">
+                <div className="reminder-icon"><AlertIcon width={18} height={18} /></div>
+                <div className="reminder-info">
+                  <h3>Missed Clock-In Reminder</h3>
+                  <p>Get a nudge if you haven't clocked in by your usual start time</p>
+                </div>
+                <label className="toggle-switch">
+                  <input
+                    type="checkbox"
+                    checked={optionalReminders.missedClockIn}
+                    onChange={() => toggleOptionalReminder('missedClockIn')}
+                  />
+                  <span className="toggle-slider"></span>
+                </label>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ===== PROFILE PAGE ===== */}
+        {activePage === 'profile' && (
+          <Profile
+            user={user}
+            profile={profile}
+            onProfileUpdate={loadProfile}
+            onBack={() => setActivePage('dashboard')}
+            isDarkMode={isDarkMode}
+            avatarUrl={avatarUrl}
+            onAvatarChange={setAvatarUrl}
+          />
+        )}
+
+      </div>
+
+      <AIChatWidget context={buildChatContext()} />
+    </div>
+  );
+}
+
+export default Dashboard;

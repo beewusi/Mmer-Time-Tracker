@@ -1,0 +1,32 @@
+.auth-panel {
+  flex: 0 0 38%;
+  background: linear-gradient(165deg, var(--navy) 0%, var(--navy-700) 100%);
+  display: flex;
+  align-items: center;
+  padding: var(--space-6);
+}
+
+.auth-panel-inner {
+  max-width: 380px;
+}
+
+.auth-brand {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  color: var(--white);
+  margin-bottom: var(--space-5);
+}
+
+.auth-brand-name {
+  font-family: var(--font-display);
+  font-size: 26px;
+  font-weight: 700;
+  letter-spacing: 0.2px;
+}
+
+@media (max-width: 860px) {
+  .auth-panel {
+    display: none;
+  }
+}
